@@ -20,6 +20,7 @@ public final class MarkerClusterGroupState<ActualMarker>: ObservableObject {
     @Published public var cameraIdleDebounceMillis: Int { didSet { rebuildStrategy() } }
     @Published public var tileSize: Double { didSet { rebuildStrategy() } }
 
+    @Published public var debugClusterTurnLabel: Bool = false
     @Published public var showClusterRadiusCircle: Bool = false
     @Published public var clusterRadiusStrokeColor: UIColor = .red
     @Published public var clusterRadiusStrokeWidth: Double = 1.0
