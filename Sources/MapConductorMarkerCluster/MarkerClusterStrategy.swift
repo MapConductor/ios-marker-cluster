@@ -63,6 +63,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
     public let enablePanAnimation: Bool
     public let zoomAnimationDurationMillis: Int
     public let cameraIdleDebounceMillis: Int
+    public let debugHullPolygons: Bool
 
     private var sourceStates: [String: MarkerState] = [:]
     private var sourceFingerprints: [String: MarkerFingerPrint] = [:]
@@ -104,6 +105,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         zoomAnimationDurationMillis: Int = DEFAULT_ZOOM_ANIMATION_DURATION_MILLIS,
         cameraIdleDebounceMillis: Int = DEFAULT_CAMERA_DEBOUNCE_MILLIS,
         tileSize: Double = DEFAULT_TILE_SIZE,
+        debugHullPolygons: Bool = false,
         semaphore: AsyncSemaphore = AsyncSemaphore(1)
     ) {
         self.clusterRadiusPx = clusterRadiusPx
@@ -117,6 +119,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         self.zoomAnimationDurationMillis = zoomAnimationDurationMillis
         self.cameraIdleDebounceMillis = cameraIdleDebounceMillis
         self.tileSize = tileSize
+        self.debugHullPolygons = debugHullPolygons
         super.init(semaphore: semaphore)
     }
 
@@ -349,6 +352,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 	            }
 	            let expandedBounds = expandBounds(bounds: viewport, margin: expandMargin)
 	            let zoom = cameraPosition.zoom
+	            let effectiveRadiusPx = effectiveClusterRadiusPx(zoom: zoom)
 	            let zoomChange = updateClusteringTurn(zoom: zoom)
 	            let turn = zoomChange.turn
             let zoomChanged = zoomChange.zoomChanged
@@ -462,8 +466,8 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                 if token != currentToken() { return }
                 let (x, y) = projectToPixel(position: state.position, zoom: zoom, tileSize: tileSize)
                 let cell = ClusterCell(
-                    x: Int(floor(x / clusterRadiusPx)),
-                    y: Int(floor(y / clusterRadiusPx))
+                    x: Int(floor(x / effectiveRadiusPx)),
+                    y: Int(floor(y / effectiveRadiusPx))
                 )
                 newClustered[cell, default: []].append(state)
             }
@@ -483,7 +487,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             if Task.isCancelled { return }
             if token != currentToken() { return }
 
-            let newMergedClusters = mergeClusters(candidates: newCandidates, zoom: zoom)
+            let newMergedClusters = mergeClusters(candidates: newCandidates, zoom: zoom, effectiveRadiusPx: effectiveRadiusPx)
 
             // Early return check after heavy processing
             if Task.isCancelled { return }
@@ -506,7 +510,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                     guard let cachedPosition = lastClusterPositionsSnapshot[cachedClusterId] else { continue }
 
                     let metersPerPixelVal = metersPerPixel(position: newCenter, zoom: zoom, tileSize: tileSize)
-                    let thresholdMeters = clusterRadiusPx * metersPerPixelVal
+                    let thresholdMeters = effectiveRadiusPx * metersPerPixelVal
                     let distance = Spherical.computeDistanceBetween(newCenter, cachedPosition)
 
                     if distance <= thresholdMeters {
@@ -589,8 +593,8 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                     let initialCenter = merged.center
                     let (cx, cy) = projectToPixel(position: initialCenter, zoom: zoom, tileSize: tileSize)
                     let cell = ClusterCell(
-                        x: Int(floor(cx / clusterRadiusPx)),
-                        y: Int(floor(cy / clusterRadiusPx))
+                        x: Int(floor(cx / effectiveRadiusPx)),
+                        y: Int(floor(cy / effectiveRadiusPx))
                     )
                     let clusterId = buildClusterId(cell: cell, zoom: zoom)
 
@@ -610,12 +614,17 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                         count: merged.members.count,
                         markerIds: merged.members.map { $0.id }
                     )
+                    let hull = convexHullProjected(members: merged.members, zoom: zoom)
+                    let hullGeoPoints: [GeoPoint] = debugHullPolygons && hull.count >= 3
+                        ? hull.map { unprojectFromPixel(x: $0.x, y: $0.y, zoom: zoom) }
+                        : []
                     debugInfos.append(
                         MarkerClusterDebugInfo(
                             id: clusterId,
                             center: center,
                             radiusMeters: radiusMeters,
-                            count: merged.members.count
+                            count: merged.members.count,
+                            hullPoints: hullGeoPoints
                         )
                     )
                     extendCoverageBounds(bounds: coverageBounds, center: center, radiusMeters: radiusMeters)
@@ -1314,7 +1323,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         return (Earth.circumferenceMeters * cos(latitudeRadians)) / scale
     }
 
-    private func mergeClusters(candidates: [ClusterCandidate], zoom: Double) -> [MergedCluster] {
+    private func mergeClusters(candidates: [ClusterCandidate], zoom: Double, effectiveRadiusPx: Double) -> [MergedCluster] {
         guard !candidates.isEmpty else { return [] }
         var parent = Array(0..<candidates.count)
 
@@ -1341,7 +1350,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             for j in (i + 1)..<candidates.count {
                 let centerB = candidates[j].center
                 let metersPerPixelB = metersPerPixel(position: centerB, zoom: zoom, tileSize: tileSize)
-                let thresholdMeters = clusterRadiusPx * max(metersPerPixelA, metersPerPixelB)
+                let thresholdMeters = effectiveRadiusPx * max(metersPerPixelA, metersPerPixelB)
                 let distanceMeters = Spherical.computeDistanceBetween(centerA, centerB)
                 if distanceMeters <= thresholdMeters {
                     union(i, j)
@@ -1360,12 +1369,12 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             group.forEach { candidate in
                 members.append(contentsOf: candidate.members)
             }
-            let center = selectDenseCenter(members: members, zoom: zoom)
+            let center = selectDenseCenter(members: members, zoom: zoom, effectiveRadiusPx: effectiveRadiusPx)
             return MergedCluster(center: center, members: members)
         }
     }
 
-    private func selectDenseCenter(members: [MarkerState], zoom: Double) -> GeoPoint {
+    private func selectDenseCenter(members: [MarkerState], zoom: Double, effectiveRadiusPx: Double) -> GeoPoint {
         guard !members.isEmpty else { return GeoPoint(latitude: 0.0, longitude: 0.0) }
         if members.count == 1 {
             return GeoPoint.from(position: members[0].position)
@@ -1375,7 +1384,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             let (x, y) = projectToPixel(position: member.position, zoom: zoom, tileSize: tileSize)
             return PixelPoint(member: member, x: x, y: y)
         }
-        let cellSize = clusterRadiusPx
+        let cellSize = effectiveRadiusPx
         var cellMap: [CellKey: [PixelPoint]] = [:]
         for point in points {
             let key = CellKey(
@@ -1426,6 +1435,52 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         }
 
         return GeoPoint.from(position: bestPoint.member.position)
+    }
+
+    private func convexHullProjected(members: [MarkerState], zoom: Double) -> [HullPoint] {
+        guard members.count >= 3 else { return [] }
+        var points = members.map { state -> HullPoint in
+            let (x, y) = projectToPixel(position: state.position, zoom: zoom, tileSize: tileSize)
+            return HullPoint(x: x, y: y)
+        }
+        var seen = Set<Int64>()
+        points = points.filter { p in
+            let key = (Int64(p.x * 1e3) << 32) ^ Int64(p.y * 1e3)
+            return seen.insert(key).inserted
+        }
+        guard points.count >= 3 else { return [] }
+        points.sort { lhs, rhs in lhs.x != rhs.x ? lhs.x < rhs.x : lhs.y < rhs.y }
+        func cross(_ o: HullPoint, _ a: HullPoint, _ b: HullPoint) -> Double {
+            (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+        }
+        var lower: [HullPoint] = []
+        for p in points {
+            while lower.count >= 2 && cross(lower[lower.count - 2], lower[lower.count - 1], p) <= 0 { lower.removeLast() }
+            lower.append(p)
+        }
+        var upper: [HullPoint] = []
+        for p in points.reversed() {
+            while upper.count >= 2 && cross(upper[upper.count - 2], upper[upper.count - 1], p) <= 0 { upper.removeLast() }
+            upper.append(p)
+        }
+        let hull = lower.dropLast() + upper.dropLast()
+        return hull.count >= 3 ? Array(hull) : []
+    }
+
+    private func unprojectFromPixel(x: Double, y: Double, zoom: Double) -> GeoPoint {
+        let scale = tileSize * pow(2.0, zoom)
+        let longitude = x / scale * 360.0 - 180.0
+        let sinLat = tanh((0.5 - y / scale) * 2.0 * Double.pi)
+        let latitude = asin(min(max(sinLat, -1.0), 1.0)) * 180.0 / Double.pi
+        return GeoPoint(latitude: latitude, longitude: longitude)
+    }
+
+    private func effectiveClusterRadiusPx(zoom: Double) -> Double {
+        let referenceZoom = 10.0
+        let minScale = 0.35
+        let minRadiusPx = 18.0
+        let scale = min(max(zoom / referenceZoom, minScale), 1.0)
+        return max(minRadiusPx, clusterRadiusPx * scale)
     }
 
     private func calculateClusterRadiusMeters(center: GeoPoint, members: [MarkerState]) -> Double {
@@ -1511,6 +1566,11 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 
     private struct PixelPoint {
         let member: MarkerState
+        let x: Double
+        let y: Double
+    }
+
+    private struct HullPoint {
         let x: Double
         let y: Double
     }
