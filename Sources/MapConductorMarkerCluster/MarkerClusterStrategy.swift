@@ -594,8 +594,12 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                 if Task.isCancelled { return }
                 if token != currentToken() { return }
                 if merged.members.count >= minClusterSize {
-                    // First compute initial center to determine cluster cell/ID
-                    let initialCenter = merged.center
+                    // Compute hull once; reuse for both centroid and debug visualization.
+                    let hull = convexHullProjected(members: merged.members, zoom: zoom)
+                    let centroidPoint = polygonCentroidProjected(hull)
+                    let initialCenter: GeoPoint = centroidPoint
+                        .map { unprojectFromPixel(x: $0.x, y: $0.y, zoom: zoom) }
+                        ?? merged.center
                     let (cx, cy) = projectToPixel(position: initialCenter, zoom: zoom, tileSize: tileSize)
                     let cell = ClusterCell(
                         x: Int(floor(cx / effectiveRadiusPx)),
@@ -603,9 +607,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                     )
                     let clusterId = buildClusterId(cell: cell, zoom: zoom)
 
-                    // Check if we have a cached position for this cluster.
-                    // Reuse it during panning to prevent cluster markers from moving unnecessarily,
-                    // but only when marker source states haven't changed since last render.
+                    // Reuse cached position during panning when source hasn't changed.
                     let center: GeoPoint
                     if let cachedPosition = lastClusterPositionsSnapshot[clusterId],
                        !zoomChanged,
@@ -619,7 +621,6 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                         count: merged.members.count,
                         markerIds: merged.members.map { $0.id }
                     )
-                    let hull = convexHullProjected(members: merged.members, zoom: zoom)
                     let hullGeoPoints: [GeoPoint] = debugHullPolygons && hull.count >= 3
                         ? hull.map { unprojectFromPixel(x: $0.x, y: $0.y, zoom: zoom) }
                         : []
@@ -1433,6 +1434,29 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         }
 
         return GeoPoint.from(position: bestPoint.member.position)
+    }
+
+    private func polygonCentroidProjected(_ hull: [HullPoint]) -> HullPoint? {
+        guard hull.count >= 3 else { return nil }
+        var twiceArea = 0.0
+        var cx = 0.0
+        var cy = 0.0
+        for i in hull.indices {
+            let a = hull[i]
+            let b = hull[(i + 1) % hull.count]
+            let cross = a.x * b.y - b.x * a.y
+            twiceArea += cross
+            cx += (a.x + b.x) * cross
+            cy += (a.y + b.y) * cross
+        }
+        if abs(twiceArea) < 1e-6 {
+            let ax = hull.reduce(0.0) { $0 + $1.x } / Double(hull.count)
+            let ay = hull.reduce(0.0) { $0 + $1.y } / Double(hull.count)
+            return HullPoint(x: ax, y: ay)
+        }
+        cx /= 3.0 * twiceArea
+        cy /= 3.0 * twiceArea
+        return HullPoint(x: cx, y: cy)
     }
 
     private func convexHullProjected(members: [MarkerState], zoom: Double) -> [HullPoint] {
