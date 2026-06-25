@@ -2,11 +2,11 @@ import Combine
 import Foundation
 import MapConductorCore
 
-private let markerClusterDefaultClusterRadiusPx: Double = 60.0
-private let markerClusterDefaultMinClusterSize: Int = 2
+private let markerClusterDefaultClusterRadiusPx: Double = 90.0
+private let markerClusterDefaultMinClusterSize: Int = 3
 private let markerClusterDefaultExpandMargin: Double = 0.2
 private let markerClusterDefaultTileSize: Double = 256.0
-private let markerClusterDefaultZoomAnimationDurationMillis: Int = 200
+private let markerClusterDefaultZoomAnimationDurationMillis: Int = 300
 public let markerClusterCameraDebounceMillis: Int = 100
 private let markerClusterAnimationFrameMillis: Int = 16
 private let markerClusterMaxDenseCells: Int = 4
@@ -422,6 +422,31 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             var cachedMarkers: [MarkerState] = []
             var newMarkers: [MarkerState] = []
 
+            // Antimeridian-aware viewport containment check.
+            // GeoRectBounds.contains(point:) does not handle the case where the viewport crosses
+            // the date line (sw.longitude > ne.longitude). At very low zoom the heuristic is inverted
+            // to avoid excluding large portions of the globe.
+            func containsInViewport(_ bounds: GeoRectBounds?, point: GeoPoint) -> Bool {
+                guard let bounds, !bounds.isEmpty else { return false }
+                guard let sw = bounds.southWest, let ne = bounds.northEast else { return false }
+                func wrapLon(_ lon: Double) -> Double {
+                    let r = lon.truncatingRemainder(dividingBy: 360.0)
+                    return r > 180 ? r - 360 : r < -180 ? r + 360 : r
+                }
+                guard point.latitude >= sw.latitude && point.latitude <= ne.latitude else { return false }
+                let pLon = wrapLon(point.longitude)
+                let west = wrapLon(sw.longitude)
+                let east = wrapLon(ne.longitude)
+                if west <= east { return pLon >= west && pLon <= east }
+                // Antimeridian crossing (west > east).
+                if zoom <= 4.0 {
+                    // At very low zoom the visible region can span >180°; treat bounds as a large
+                    // span and accept the complement range so most markers remain visible.
+                    return pLon >= east && pLon <= west
+                }
+                return pLon >= west || pLon <= east
+            }
+
             let sourceSnapshot: [MarkerState] = {
                 sourceStatesLock.lock()
                 defer { sourceStatesLock.unlock() }
@@ -430,7 +455,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             for state in sourceSnapshot {
                 if Task.isCancelled { return }
                 if token != currentToken() { return }
-                if !expandedBounds.contains(point: state.position) { continue }
+                if !containsInViewport(expandedBounds, point: state.position) { continue }
 
                 let currentFingerprint = state.fingerPrint()
                 let lastFingerprint = lastSourceFingerprintsSnapshot[state.id]
@@ -441,7 +466,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 
                 if let lastCoverageBounds = lastClusterCoverageBoundsSnapshot,
                    !zoomChanged,
-                   lastCoverageBounds.contains(point: state.position),
+                   containsInViewport(lastCoverageBounds, point: state.position),
                    lastClusterAssignmentsSnapshot[state.id] != nil,
                    !movedSinceLastRender {
                     cachedMarkers.append(state)
@@ -1179,18 +1204,16 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 
         func animationFrameMillis(forMoveCount count: Int) -> Int {
             // Keep small animations smooth, but aggressively drop FPS when many markers move.
-            // (Empirically, ~8fps is acceptable for large fan-out / fan-in cluster transitions.)
-//            switch count {
-//            case ..<50:
-//                return 16 // ~60fps
-//            case ..<100:
-//                return 33 // ~30fps
-//            case ..<300:
-//                return 74 // ~15fps
-//            default:
-//                return 125 // ~8fps
-//            }
-             return 74
+            switch count {
+            case ..<50:
+                return 16  // ~60fps
+            case ..<100:
+                return 33  // ~30fps
+            case ..<300:
+                return 125 // ~8fps
+            default:
+                return 250 // ~4fps
+            }
         }
 
         let targetFrameMillis = max(1, min(durationMillis, animationFrameMillis(forMoveCount: activeMoves.count)))
