@@ -5,16 +5,19 @@ public struct MarkerClusterDebugInfo: Equatable, Hashable {
     public let center: GeoPoint
     public let radiusMeters: Double
     public let count: Int
+    public let hullPoints: [GeoPoint]
 
     public init(
         id: String,
         center: GeoPoint,
         radiusMeters: Double,
-        count: Int
+        count: Int,
+        hullPoints: [GeoPoint] = []
     ) {
         self.id = id
         self.center = center
         self.radiusMeters = radiusMeters
         self.count = count
+        self.hullPoints = hullPoints
     }
 }

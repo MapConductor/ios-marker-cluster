@@ -1,6 +1,12 @@
 import MapConductorCore
+import UIKit
 
 private let markerClusterGroupClusterCircleIdPrefix = "cluster-circle-"
+private let markerClusterGroupHullPolygonIdPrefix = "cluster-hull-"
+private let debugHullPalette: [UIColor] = [
+    .systemBlue, .systemGreen, .systemRed, .systemOrange,
+    .systemPurple, .systemCyan, .systemYellow, .systemPink,
+]
 
 /// Android SDKの`MarkerClusterGroup`に合わせた、iOS側の薄いラッパーです。
 public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
@@ -75,6 +81,28 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
         passthrough.markers = []
         passthrough.markerRenderingStrategy = nil
         passthrough.markerRenderingMarkers = []
+
+        if strategy.debugHullPolygons {
+            let polygons = strategy.debugInfoFlow.value
+                .filter { $0.hullPoints.count >= 3 }
+                .enumerated()
+                .map { index, info -> Polygon in
+                    let base = debugHullPalette[index % debugHullPalette.count]
+                    return Polygon(
+                        points: info.hullPoints,
+                        id: "\(markerClusterGroupHullPolygonIdPrefix)\(info.id)",
+                        strokeColor: base.withAlphaComponent(0.8),
+                        strokeWidth: 2.0,
+                        fillColor: base.withAlphaComponent(0.18),
+                        geodesic: false,
+                        zIndex: 9,
+                        extra: info,
+                        onClick: nil
+                    )
+                }
+            passthrough.polygons.append(contentsOf: polygons)
+        }
+
         self.overlayContent = passthrough
     }
 
@@ -113,6 +141,27 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
                 )
             }
             passthrough.circles.append(contentsOf: circles)
+        }
+
+        if state.debugHullPolygons {
+            let polygons = state.debugInfos
+                .filter { $0.hullPoints.count >= 3 }
+                .enumerated()
+                .map { index, info -> Polygon in
+                    let base = debugHullPalette[index % debugHullPalette.count]
+                    return Polygon(
+                        points: info.hullPoints,
+                        id: "\(markerClusterGroupHullPolygonIdPrefix)\(info.id)",
+                        strokeColor: base.withAlphaComponent(CGFloat(state.debugHullStrokeAlpha)),
+                        strokeWidth: state.debugHullStrokeWidth,
+                        fillColor: base.withAlphaComponent(CGFloat(state.debugHullFillAlpha)),
+                        geodesic: false,
+                        zIndex: 9,
+                        extra: info,
+                        onClick: nil
+                    )
+                }
+            passthrough.polygons.append(contentsOf: polygons)
         }
 
         self.overlayContent = passthrough
