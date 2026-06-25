@@ -478,6 +478,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             }.compactMap { cell -> ClusterCandidate? in
                 guard let members = newClustered[cell], let center = members.first?.position else { return nil }
                 return ClusterCandidate(
+                    cell: cell,
                     center: GeoPoint.from(position: center),
                     members: members
                 )
@@ -1325,53 +1326,46 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 
     private func mergeClusters(candidates: [ClusterCandidate], zoom: Double, effectiveRadiusPx: Double) -> [MergedCluster] {
         guard !candidates.isEmpty else { return [] }
-        var parent = Array(0..<candidates.count)
 
-        func find(_ index: Int) -> Int {
-            var i = index
-            while parent[i] != i {
-                parent[i] = parent[parent[i]]
-                i = parent[i]
-            }
-            return i
+        var cellMap: [ClusterCell: ClusterCandidate] = [:]
+        for candidate in candidates {
+            cellMap[candidate.cell] = candidate
         }
 
-        func union(_ a: Int, _ b: Int) {
-            let rootA = find(a)
-            let rootB = find(b)
-            if rootA != rootB {
-                parent[rootB] = rootA
-            }
-        }
+        var merged: [MergedCluster] = []
+        var visited: Set<ClusterCell> = []
 
-        for i in 0..<candidates.count {
-            let centerA = candidates[i].center
-            let metersPerPixelA = metersPerPixel(position: centerA, zoom: zoom, tileSize: tileSize)
-            for j in (i + 1)..<candidates.count {
-                let centerB = candidates[j].center
-                let metersPerPixelB = metersPerPixel(position: centerB, zoom: zoom, tileSize: tileSize)
-                let thresholdMeters = effectiveRadiusPx * max(metersPerPixelA, metersPerPixelB)
-                let distanceMeters = Spherical.computeDistanceBetween(centerA, centerB)
-                if distanceMeters <= thresholdMeters {
-                    union(i, j)
+        for candidate in candidates {
+            let cell = candidate.cell
+            guard !visited.contains(cell) else { continue }
+            visited.insert(cell)
+
+            var seedMembers = candidate.members
+
+            for dx in -1...1 {
+                for dy in -1...1 {
+                    if dx == 0 && dy == 0 { continue }
+                    let neighborCell = ClusterCell(x: cell.x + dx, y: cell.y + dy)
+                    guard let neighbor = cellMap[neighborCell] else { continue }
+                    guard !visited.contains(neighborCell) else { continue }
+
+                    let metersPerPixelA = metersPerPixel(position: candidate.center, zoom: zoom, tileSize: tileSize)
+                    let metersPerPixelB = metersPerPixel(position: neighbor.center, zoom: zoom, tileSize: tileSize)
+                    let thresholdMeters = effectiveRadiusPx * max(metersPerPixelA, metersPerPixelB)
+                    let distanceMeters = Spherical.computeDistanceBetween(candidate.center, neighbor.center)
+
+                    if distanceMeters <= thresholdMeters {
+                        visited.insert(neighborCell)
+                        seedMembers.append(contentsOf: neighbor.members)
+                    }
                 }
             }
+
+            let center = selectDenseCenter(members: seedMembers, zoom: zoom, effectiveRadiusPx: effectiveRadiusPx)
+            merged.append(MergedCluster(center: center, members: seedMembers))
         }
 
-        var mergedMap: [Int: [ClusterCandidate]] = [:]
-        for (index, candidate) in candidates.enumerated() {
-            let root = find(index)
-            mergedMap[root, default: []].append(candidate)
-        }
-
-        return mergedMap.values.map { group in
-            var members: [MarkerState] = []
-            group.forEach { candidate in
-                members.append(contentsOf: candidate.members)
-            }
-            let center = selectDenseCenter(members: members, zoom: zoom, effectiveRadiusPx: effectiveRadiusPx)
-            return MergedCluster(center: center, members: members)
-        }
+        return merged
     }
 
     private func selectDenseCenter(members: [MarkerState], zoom: Double, effectiveRadiusPx: Double) -> GeoPoint {
@@ -1527,6 +1521,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
     }
 
     private struct ClusterCandidate {
+        let cell: ClusterCell
         let center: GeoPoint
         let members: [MarkerState]
     }

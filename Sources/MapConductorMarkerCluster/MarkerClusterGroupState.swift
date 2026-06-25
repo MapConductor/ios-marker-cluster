@@ -25,6 +25,10 @@ public final class MarkerClusterGroupState<ActualMarker>: ObservableObject {
     @Published public var clusterRadiusStrokeColor: UIColor = .red
     @Published public var clusterRadiusStrokeWidth: Double = 1.0
     @Published public var clusterRadiusFillColor: UIColor = .clear
+    @Published public var debugHullPolygons: Bool = false { didSet { rebuildStrategy() } }
+    @Published public var debugHullStrokeWidth: Double = 2.0
+    @Published public var debugHullStrokeAlpha: Float = 0.8
+    @Published public var debugHullFillAlpha: Float = 0.18
     @Published public private(set) var debugInfos: [MarkerClusterDebugInfo] = []
 
     public private(set) var strategy: MarkerClusterStrategy<ActualMarker>
@@ -41,7 +45,8 @@ public final class MarkerClusterGroupState<ActualMarker>: ObservableObject {
         enablePanAnimation: Bool = false,
         zoomAnimationDurationMillis: Int = MarkerClusterStrategy<ActualMarker>.DEFAULT_ZOOM_ANIMATION_DURATION_MILLIS,
         cameraIdleDebounceMillis: Int = MarkerClusterStrategy<ActualMarker>.DEFAULT_CAMERA_DEBOUNCE_MILLIS,
-        tileSize: Double = MarkerClusterStrategy<ActualMarker>.DEFAULT_TILE_SIZE
+        tileSize: Double = MarkerClusterStrategy<ActualMarker>.DEFAULT_TILE_SIZE,
+        debugHullPolygons: Bool = false
     ) {
         self.clusterRadiusPx = clusterRadiusPx
         self.minClusterSize = minClusterSize
@@ -54,6 +59,7 @@ public final class MarkerClusterGroupState<ActualMarker>: ObservableObject {
         self.zoomAnimationDurationMillis = zoomAnimationDurationMillis
         self.cameraIdleDebounceMillis = cameraIdleDebounceMillis
         self.tileSize = tileSize
+        self.debugHullPolygons = debugHullPolygons
 
         self.strategy =
             MarkerClusterStrategy<ActualMarker>(
@@ -67,7 +73,8 @@ public final class MarkerClusterGroupState<ActualMarker>: ObservableObject {
                 enablePanAnimation: enablePanAnimation,
                 zoomAnimationDurationMillis: zoomAnimationDurationMillis,
                 cameraIdleDebounceMillis: cameraIdleDebounceMillis,
-                tileSize: tileSize
+                tileSize: tileSize,
+                debugHullPolygons: debugHullPolygons
             )
         bindDebugInfo()
     }
@@ -86,7 +93,8 @@ public final class MarkerClusterGroupState<ActualMarker>: ObservableObject {
                 enablePanAnimation: enablePanAnimation,
                 zoomAnimationDurationMillis: zoomAnimationDurationMillis,
                 cameraIdleDebounceMillis: cameraIdleDebounceMillis,
-                tileSize: tileSize
+                tileSize: tileSize,
+                debugHullPolygons: debugHullPolygons
             )
         bindDebugInfo()
     }
