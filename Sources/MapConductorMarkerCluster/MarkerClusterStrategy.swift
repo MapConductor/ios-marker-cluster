@@ -395,6 +395,10 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                 return
             }
 
+            await cleanupStaleMarkers(currentZoom: zoom, skipClusterRemoval: animateTransitions)
+            if Task.isCancelled { return }
+            if token != currentToken() { return }
+
             var debugInfos: [MarkerClusterDebugInfo] = []
             var clusterMemberCenters: [String: GeoPoint] = [:]
             var clusterPositions: [String: GeoPoint] = [:]
@@ -1467,6 +1471,52 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         let sinLat = tanh((0.5 - y / scale) * 2.0 * Double.pi)
         let latitude = asin(min(max(sinLat, -1.0), 1.0)) * 180.0 / Double.pi
         return GeoPoint(latitude: latitude, longitude: longitude)
+    }
+
+    @MainActor
+    private func cleanupStaleMarkers(currentZoom: Double, skipClusterRemoval: Bool) async {
+        guard let renderer = rendererBox.get() else { return }
+        let currentZoomKey = Int(currentZoom.rounded())
+
+        renderStateLock.lock()
+        let allEntities = Array(renderedMarkerEntities.values)
+        renderStateLock.unlock()
+
+        sourceStatesLock.lock()
+        let sourceIds = Set(sourceStates.keys)
+        sourceStatesLock.unlock()
+
+        var staleEntities: [MarkerEntity<ActualMarker>] = []
+        for entity in allEntities {
+            let id = entity.state.id
+            let isStale: Bool
+            if id.hasPrefix("cluster_") {
+                if skipClusterRemoval {
+                    isStale = false
+                } else {
+                    // ID format: cluster_{zoomKey}_{x}_{y}
+                    let parts = id.split(separator: "_")
+                    if parts.count >= 4, let markerZoomKey = Int(parts[1]) {
+                        isStale = markerZoomKey != currentZoomKey
+                    } else {
+                        isStale = false
+                    }
+                }
+            } else {
+                isStale = !sourceIds.contains(id)
+            }
+            if isStale { staleEntities.append(entity) }
+        }
+
+        guard !staleEntities.isEmpty else { return }
+        await renderer.onRemove(data: staleEntities)
+        renderStateLock.lock()
+        for entity in staleEntities {
+            renderedMarkerEntities.removeValue(forKey: entity.state.id)
+            _ = markerManager.removeEntity(entity.state.id)
+        }
+        renderStateLock.unlock()
+        await renderer.onPostProcess()
     }
 
     private func effectiveClusterRadiusPx(zoom: Double) -> Double {
