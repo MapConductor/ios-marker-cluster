@@ -259,7 +259,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             guard token == self.currentToken() else { return }
             let viewport =
                 mapCameraPosition.visibleRegion?.bounds ??
-                self.estimateViewport(zoom: mapCameraPosition.zoom) ??
+                self.estimateViewport(zoom: mapCameraPosition.zoom, center: mapCameraPosition.position) ??
                 self.lastViewport
             guard let viewport else {
                 MCLog.marker("MarkerClusterStrategy[\(self.instanceId)].onCameraChanged viewportMissing")
@@ -1574,29 +1574,36 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         await renderer.onPostProcess()
     }
 
-    // Returns a viewport estimate for the given zoom level when the actual visibleRegion is
-    // unavailable. Scales the last known viewport around its center by 2^(zoomDelta) so that
-    // the estimated bounds cover the same screen-space area as the new zoom level.
-    private func estimateViewport(zoom: Double) -> GeoRectBounds? {
+    // Returns a viewport estimate when the actual visibleRegion is unavailable.
+    // The previous viewport shape is scaled by zoom and recentered on the current camera.
+    private func estimateViewport(zoom: Double, center: GeoPointProtocol) -> GeoRectBounds? {
         guard let base = lastViewport, let baseZoom = lastKnownViewportZoom else { return nil }
         guard let sw = base.southWest, let ne = base.northEast else { return nil }
         let zoomDelta = baseZoom - zoom
-        if zoomDelta == 0.0 { return base }
-        let centerLat = (sw.latitude + ne.latitude) / 2.0
-        let centerLon = (sw.longitude + ne.longitude) / 2.0
         let scale = pow(2.0, zoomDelta)
-        let halfLat = (ne.latitude - sw.latitude) / 2.0 * scale
-        let halfLon = (ne.longitude - sw.longitude) / 2.0 * scale
+        let wrappedCenter = GeoPoint.from(position: center.wrap())
+        let centerLat = wrappedCenter.latitude
+        let centerLon = wrappedCenter.longitude
+        let lonSpan = sw.longitude <= ne.longitude
+            ? ne.longitude - sw.longitude
+            : ne.longitude + 360.0 - sw.longitude
+        let halfLat = min(90.0, max(0.0, (ne.latitude - sw.latitude) / 2.0 * scale))
+        let halfLon = min(180.0, max(0.0, lonSpan / 2.0 * scale))
         let result = GeoRectBounds()
         result.extend(point: GeoPoint(
             latitude: max(-90.0, min(90.0, centerLat - halfLat)),
-            longitude: max(-180.0, min(180.0, centerLon - halfLon))
+            longitude: wrapLongitude(centerLon - halfLon)
         ))
         result.extend(point: GeoPoint(
             latitude: max(-90.0, min(90.0, centerLat + halfLat)),
-            longitude: max(-180.0, min(180.0, centerLon + halfLon))
+            longitude: wrapLongitude(centerLon + halfLon)
         ))
         return result
+    }
+
+    private func wrapLongitude(_ longitude: Double) -> Double {
+        (((longitude + 180.0).truncatingRemainder(dividingBy: 360.0) + 360.0)
+            .truncatingRemainder(dividingBy: 360.0)) - 180.0
     }
 
     private func effectiveClusterRadiusPx(zoom: Double) -> Double {
