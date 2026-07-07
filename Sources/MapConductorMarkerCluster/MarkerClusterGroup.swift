@@ -2,17 +2,48 @@ import MapConductorCore
 import UIKit
 
 private let markerClusterGroupClusterCircleIdPrefix = "cluster-circle-"
-private let markerClusterGroupHullPolygonIdPrefix = "cluster-hull-"
-private let debugHullPalette: [UIColor] = [
+let markerClusterGroupHullPolygonIdPrefix = "cluster-hull-"
+let debugHullPalette: [UIColor] = [
     .systemBlue, .systemGreen, .systemRed, .systemOrange,
     .systemPurple, .systemCyan, .systemYellow, .systemPink,
 ]
+
+/// Builds `PolygonState` objects for cluster hull polygons from debug infos.
+/// Used by ``MarkerClusterGroupState`` via `onBeforeAnimation` for imperative polygon management.
+func makeHullPolygonStates(
+    from debugInfos: [MarkerClusterDebugInfo],
+    strokeAlpha: CGFloat,
+    fillAlpha: CGFloat,
+    strokeWidth: Double
+) -> [PolygonState] {
+    debugInfos
+        .filter { $0.hullPoints.count >= 3 }
+        .enumerated()
+        .map { index, info in
+            let base = debugHullPalette[index % debugHullPalette.count]
+            return PolygonState(
+                points: info.hullPoints,
+                id: "\(markerClusterGroupHullPolygonIdPrefix)\(info.id)",
+                strokeColor: base.withAlphaComponent(strokeAlpha),
+                strokeWidth: strokeWidth,
+                fillColor: base.withAlphaComponent(fillAlpha),
+                geodesic: false,
+                zIndex: 9,
+                extra: info,
+                onClick: nil
+            )
+        }
+}
 
 /// Android SDKの`MarkerClusterGroup`に合わせた、iOS側の薄いラッパーです。
 public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
     public let strategy: AnyMarkerRenderingStrategy<ActualMarker>
     public let markers: [MarkerState]
     private let overlayContent: MapViewContent
+    // Passed to MapViewContent so the map view coordinator can wire up imperative
+    // polygon sync via PolygonSyncHandler. State-backed groups keep this connected
+    // so debug hull polygons can be cleared when the switch is turned off.
+    private let polygonSyncHandler: (any PolygonSyncHandler)?
 
     public init(
         strategy: MarkerClusterStrategy<ActualMarker>,
@@ -21,15 +52,17 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
         self.strategy = AnyMarkerRenderingStrategy(strategy)
         self.markers = markers
         self.overlayContent = MapViewContent()
+        self.polygonSyncHandler = nil
     }
 
     public init(
-        state: MarkerClusterGroupState<ActualMarker>,
+        state: MarkerClusterGroupState,
         markers: [MarkerState]
     ) {
-        self.strategy = AnyMarkerRenderingStrategy(state.strategy)
+        self.strategy = AnyMarkerRenderingStrategy(state.strategy(for: ActualMarker.self))
         self.markers = markers
         self.overlayContent = MapViewContent()
+        self.polygonSyncHandler = state
     }
 
     public init(
@@ -82,32 +115,13 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
         passthrough.markerRenderingStrategy = nil
         passthrough.markerRenderingMarkers = []
 
-        if strategy.debugHullPolygons {
-            let polygons = strategy.debugInfoFlow.value
-                .filter { $0.hullPoints.count >= 3 }
-                .enumerated()
-                .map { index, info -> Polygon in
-                    let base = debugHullPalette[index % debugHullPalette.count]
-                    return Polygon(
-                        points: info.hullPoints,
-                        id: "\(markerClusterGroupHullPolygonIdPrefix)\(info.id)",
-                        strokeColor: base.withAlphaComponent(0.8),
-                        strokeWidth: 2.0,
-                        fillColor: base.withAlphaComponent(0.18),
-                        geodesic: false,
-                        zIndex: 9,
-                        extra: info,
-                        onClick: nil
-                    )
-                }
-            passthrough.polygons.append(contentsOf: polygons)
-        }
-
+        // Hull polygons are managed imperatively via onBeforeAnimation; skip declarative build.
         self.overlayContent = passthrough
+        self.polygonSyncHandler = strategy.debugHullPolygons ? strategy : nil
     }
 
     public init(
-        state: MarkerClusterGroupState<ActualMarker>,
+        state: MarkerClusterGroupState,
         @MapViewContentBuilder content: () -> MapViewContent
     ) {
         let inner = content()
@@ -116,7 +130,7 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
             (inner.markerRenderingMarkers + inner.markers.map(\.state))
             .filter { seenIds.insert($0.id).inserted }
 
-        self.strategy = AnyMarkerRenderingStrategy(state.strategy)
+        self.strategy = AnyMarkerRenderingStrategy(state.strategy(for: ActualMarker.self))
         self.markers = markerStates
 
         var passthrough = inner
@@ -143,28 +157,10 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
             passthrough.circles.append(contentsOf: circles)
         }
 
-        if state.debugHullPolygons {
-            let polygons = state.debugInfos
-                .filter { $0.hullPoints.count >= 3 }
-                .enumerated()
-                .map { index, info -> Polygon in
-                    let base = debugHullPalette[index % debugHullPalette.count]
-                    return Polygon(
-                        points: info.hullPoints,
-                        id: "\(markerClusterGroupHullPolygonIdPrefix)\(info.id)",
-                        strokeColor: base.withAlphaComponent(CGFloat(state.debugHullStrokeAlpha)),
-                        strokeWidth: state.debugHullStrokeWidth,
-                        fillColor: base.withAlphaComponent(CGFloat(state.debugHullFillAlpha)),
-                        geodesic: false,
-                        zIndex: 9,
-                        extra: info,
-                        onClick: nil
-                    )
-                }
-            passthrough.polygons.append(contentsOf: polygons)
-        }
-
+        // Hull polygons are managed imperatively via the state so they can also be
+        // cleared when debugHullPolygons is turned off.
         self.overlayContent = passthrough
+        self.polygonSyncHandler = state
     }
 
     public func append(to content: inout MapViewContent) {
@@ -176,5 +172,8 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
         content.views.append(contentsOf: overlayContent.views)
         content.markerRenderingStrategy = strategy
         content.markerRenderingMarkers = markers
+        if let handler = polygonSyncHandler {
+            content.polygonSyncHandlers.append(handler)
+        }
     }
 }

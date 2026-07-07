@@ -29,6 +29,30 @@ private enum MarkerClusterStrategyInstanceId {
     }
 }
 
+/// Non-generic defaults shared by ``MarkerClusterStrategy`` and ``MarkerClusterGroupState``.
+public enum MarkerClusterDefaults {
+    public static let clusterRadiusPx: Double = markerClusterDefaultClusterRadiusPx
+    public static let minClusterSize: Int = markerClusterDefaultMinClusterSize
+    public static let expandMargin: Double = markerClusterDefaultExpandMargin
+    public static let tileSize: Double = markerClusterDefaultTileSize
+    public static let zoomAnimationDurationMillis: Int = markerClusterDefaultZoomAnimationDurationMillis
+    public static let cameraIdleDebounceMillis: Int = markerClusterCameraDebounceMillis
+    public static let iconProvider: (Int) -> MarkerIconProtocol = { count in
+        DefaultMarkerIcon(label: String(count))
+    }
+}
+
+/// ActualMarker に依存しない ``MarkerClusterStrategy`` の操作面。
+/// ``MarkerClusterGroupState`` がジェネリクスなしで戦略を管理するために使う。
+protocol MarkerClusterStrategyBase: AnyObject {
+    var onBeforeAnimation: (([MarkerClusterDebugInfo]) async -> Void)? { get set }
+    var debugInfoFlow: CurrentValueSubject<[MarkerClusterDebugInfo], Never> { get }
+    func clear()
+    @MainActor func forceRender()
+}
+
+extension MarkerClusterStrategy: MarkerClusterStrategyBase {}
+
 public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingStrategy<ActualMarker> {
     public static var DEFAULT_CLUSTER_RADIUS_PX: Double { markerClusterDefaultClusterRadiusPx }
     public static var DEFAULT_MIN_CLUSTER_SIZE: Int { markerClusterDefaultMinClusterSize }
@@ -65,6 +89,11 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
     public let cameraIdleDebounceMillis: Int
     public let debugHullPolygons: Bool
 
+    /// Called synchronously before marker animations start, after cluster computation.
+    /// Set via ``MarkerClusterGroupState/bindPolygonSync(_:)`` to commit hull polygon
+    /// updates before animations begin, so polygon rendering and marker animation cannot race.
+    public var onBeforeAnimation: (([MarkerClusterDebugInfo]) async -> Void)?
+
     private var sourceStates: [String: MarkerState] = [:]
     private var sourceFingerprints: [String: MarkerFingerPrint] = [:]
     private var lastCameraPosition: MapCameraPosition?
@@ -93,6 +122,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
     private let sourceStatesLock = NSLock()
     private let renderStateLock = NSLock()
     private var sourceStateVersion: Int64 = 0
+    private var forceNextRender: Bool = false
 
     public init(
         clusterRadiusPx: Double = DEFAULT_CLUSTER_RADIUS_PX,
@@ -185,6 +215,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         lastClusterAssignments = [:]
         lastSourceStateVersion = 0
         lastSourceFingerprints = [:]
+        forceNextRender = false
         renderStateLock.unlock()
         lastKnownViewportZoom = nil
 
@@ -364,6 +395,8 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 	            let turn = zoomChange.turn
             let zoomChanged = zoomChange.zoomChanged
             renderStateLock.lock()
+            let forced = forceNextRender
+            forceNextRender = false
             let lastRenderCameraPositionSnapshot = lastRenderCameraPosition
             let lastClusterCoverageBoundsSnapshot = lastClusterCoverageBounds
             let lastClusterAssignmentsSnapshot = lastClusterAssignments
@@ -391,7 +424,8 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             }
 
             // Early return optimization: if panning and previous coverage contains current viewport (and markers didn't change), no need to recalculate
-            if !zoomChanged,
+            if !forced,
+               !zoomChanged,
                let lastClusterCoverageBoundsSnapshot,
                containsBounds(container: lastClusterCoverageBoundsSnapshot, target: expandedBounds),
                sourceStateVersionSnapshot == lastSourceStateVersionSnapshot {
@@ -653,7 +687,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                         count: merged.members.count,
                         markerIds: merged.members.map { $0.id }
                     )
-                    let hullGeoPoints: [GeoPoint] = debugHullPolygons && hull.count >= 3
+                    let hullGeoPoints: [GeoPoint] = hull.count >= 3
                         ? hull.map { unprojectFromPixel(x: $0.x, y: $0.y, zoom: zoom) }
                         : []
                     debugInfos.append(
@@ -768,6 +802,9 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 	            return
 	        }
 	        debugInfoSubject.value = debugInfos
+	        // Commit hull polygon updates before animation starts so polygon rendering
+	        // and marker animation cannot race each other.
+	        await onBeforeAnimation?(debugInfos)
 	        await updateRenderedMarkers(
 	            desiredStates: desiredStates,
 	            renderer: renderer,
@@ -1652,6 +1689,20 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         return cameraUpdateToken
     }
 
+    /// Forces a full cluster recompute on the next render, bypassing the coverage-bounds
+    /// early-return. Called by ``MarkerClusterGroupState`` to ensure hull polygons reflect
+    /// the current camera position immediately when ``debugHullPolygons`` is enabled.
+    @MainActor
+    public func forceRender() {
+        guard let cameraPosition = lastCameraPosition,
+              let viewport = lastViewport else { return }
+        renderStateLock.lock()
+        forceNextRender = true
+        renderStateLock.unlock()
+        let token = incrementToken()
+        enqueueRender(cameraPosition: cameraPosition, viewport: viewport, token: token)
+    }
+
     public static var defaultIconProvider: ClusterIconProvider {
         { count in DefaultMarkerIcon(label: String(count)) }
     }
@@ -1710,10 +1761,26 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         let x: Int
         let y: Int
     }
+}
 
-    private struct HullPoint {
-        let x: Double
-        let y: Double
+extension MarkerClusterStrategy: PolygonSyncHandler {
+    /// Wires up the strategy's ``onBeforeAnimation`` so hull polygons are committed
+    /// synchronously before marker animations start.
+    /// Called by the map view coordinator on every `updateContent` pass.
+    public func bindPolygonSync(_ polygonSync: @escaping @MainActor ([PolygonState]) async -> Void) {
+        guard debugHullPolygons else {
+            onBeforeAnimation = nil
+            return
+        }
+        onBeforeAnimation = { debugInfos in
+            let states = makeHullPolygonStates(
+                from: debugInfos,
+                strokeAlpha: 0.8,
+                fillAlpha: 0.18,
+                strokeWidth: 2.0
+            )
+            await polygonSync(states)
+        }
     }
 }
 
