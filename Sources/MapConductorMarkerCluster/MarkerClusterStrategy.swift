@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import MapConductorCore
+import UIKit
 
 private let markerClusterDefaultClusterRadiusPx: Double = 90.0
 private let markerClusterDefaultMinClusterSize: Int = 3
@@ -16,6 +17,92 @@ private let markerClusterCameraAngleEpsilon: Double = 1e-2
 private let markerClusterMinZoomDeltaForRender: Double = 0.02
 private let markerClusterDegToRad: Double = Double.pi / 180.0
 private let markerClusterMaxSinLat: Double = 0.9999
+private let markerClusterDefaultSpiderfyMarkerSizePx: Double = 52.0
+private let markerClusterDefaultSpiderfyMarkerMarginPx: Double = 8.0
+private let markerClusterDefaultSpiderfyLegWidth: Double = 1.5
+// '#666666' in the React SDK.
+private let markerClusterDefaultSpiderfyLegColor = UIColor(red: 0.4, green: 0.4, blue: 0.4, alpha: 1.0)
+
+/// ID prefix of the temporary markers rendered while a spiderfy fan is open.
+let spiderfyMarkerIdPrefix = "spider_"
+/// ID prefix of the leg polylines connecting the cluster center to fanned-out markers.
+let spiderfyLegIdPrefix = "spiderleg_"
+
+/// A screen-pixel offset relative to the spiderfied cluster's center.
+struct SpiderfyOffset {
+    var x: Double
+    var y: Double
+}
+
+/// Screen-space fan-out layout for spiderfy. Members start on an even circle
+/// around the cluster and then iteratively repel each other (and the cluster
+/// marker itself) until no pair is closer than markerSize + margin, while a
+/// weak spring toward the center keeps the fan compact. Converges to a ring
+/// for small counts and to packed shells for larger ones.
+func spiderfyLayout(
+    count: Int,
+    markerSizePx: Double,
+    marginPx: Double,
+    obstacles: [SpiderfyOffset] = []
+) -> [SpiderfyOffset] {
+    let desired = markerSizePx + marginPx
+    // クラスタ中心からの基本距離。脚線が見え、かつ離れすぎない程度
+    let centerClearance = (markerSizePx * 1.3).rounded() + marginPx
+    var points: [SpiderfyOffset] = (0..<count).map { i in
+        // 右方向(0°)基準で均等配置。2件なら左右に並び、ピン形クラスタの頭上を避けやすい
+        let angle = 2.0 * Double.pi * Double(i) / Double(count)
+        return SpiderfyOffset(x: cos(angle) * centerClearance, y: sin(angle) * centerClearance)
+    }
+    for _ in 0..<150 {
+        var maxMove = 0.0
+        for i in 0..<count {
+            var fx = 0.0
+            var fy = 0.0
+            // 展開メンバー同士の反発
+            for j in 0..<count where j != i {
+                let dx = points[i].x - points[j].x
+                let dy = points[i].y - points[j].y
+                var d = hypot(dx, dy)
+                if d == 0 { d = 0.01 }
+                if d < desired {
+                    let push = (desired - d) / 2.0
+                    fx += (dx / d) * push
+                    fy += (dy / d) * push
+                }
+            }
+            // 周囲に既に表示されているマーカー等(固定障害物)からの反発
+            for ob in obstacles {
+                let dx = points[i].x - ob.x
+                let dy = points[i].y - ob.y
+                var d = hypot(dx, dy)
+                if d == 0 { d = 0.01 }
+                if d < desired {
+                    let push = desired - d
+                    fx += (dx / d) * push
+                    fy += (dy / d) * push
+                }
+            }
+            var dc = hypot(points[i].x, points[i].y)
+            if dc == 0 { dc = 0.01 }
+            if dc < centerClearance {
+                // クラスタマーカーからの反発
+                let push = centerClearance - dc
+                fx += (points[i].x / dc) * push
+                fy += (points[i].y / dc) * push
+            } else {
+                // 中心へ弱いばね(離れすぎ防止)
+                let pull = (dc - centerClearance) * 0.15
+                fx -= (points[i].x / dc) * pull
+                fy -= (points[i].y / dc) * pull
+            }
+            points[i].x += fx * 0.6
+            points[i].y += fy * 0.6
+            maxMove = max(maxMove, abs(fx), abs(fy))
+        }
+        if maxMove < 0.15 { break }
+    }
+    return points
+}
 
 private enum MarkerClusterStrategyInstanceId {
     private static let lock = NSLock()
@@ -37,6 +124,10 @@ public enum MarkerClusterDefaults {
     public static let tileSize: Double = markerClusterDefaultTileSize
     public static let zoomAnimationDurationMillis: Int = markerClusterDefaultZoomAnimationDurationMillis
     public static let cameraIdleDebounceMillis: Int = markerClusterCameraDebounceMillis
+    public static let spiderfyMarkerSizePx: Double = markerClusterDefaultSpiderfyMarkerSizePx
+    public static let spiderfyMarkerMarginPx: Double = markerClusterDefaultSpiderfyMarkerMarginPx
+    public static let spiderfyLegColor: UIColor = markerClusterDefaultSpiderfyLegColor
+    public static let spiderfyLegWidth: Double = markerClusterDefaultSpiderfyLegWidth
     public static let iconProvider: (Int) -> MarkerIconProtocol = { count in
         DefaultMarkerIcon(label: String(count))
     }
@@ -47,6 +138,7 @@ public enum MarkerClusterDefaults {
 protocol MarkerClusterStrategyBase: AnyObject {
     var onBeforeAnimation: (([MarkerClusterDebugInfo]) async -> Void)? { get set }
     var debugInfoFlow: CurrentValueSubject<[MarkerClusterDebugInfo], Never> { get }
+    var spiderfyLegsFlow: CurrentValueSubject<[PolylineState], Never> { get }
     func clear()
     @MainActor func forceRender()
 }
@@ -60,6 +152,10 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
     public static var DEFAULT_TILE_SIZE: Double { markerClusterDefaultTileSize }
     public static var DEFAULT_ZOOM_ANIMATION_DURATION_MILLIS: Int { markerClusterDefaultZoomAnimationDurationMillis }
     public static var DEFAULT_CAMERA_DEBOUNCE_MILLIS: Int { markerClusterCameraDebounceMillis }
+    public static var DEFAULT_SPIDERFY_MARKER_SIZE_PX: Double { markerClusterDefaultSpiderfyMarkerSizePx }
+    public static var DEFAULT_SPIDERFY_MARKER_MARGIN_PX: Double { markerClusterDefaultSpiderfyMarkerMarginPx }
+    public static var DEFAULT_SPIDERFY_LEG_COLOR: UIColor { markerClusterDefaultSpiderfyLegColor }
+    public static var DEFAULT_SPIDERFY_LEG_WIDTH: Double { markerClusterDefaultSpiderfyLegWidth }
 
     private static var cameraDebounceMillis: Int { markerClusterCameraDebounceMillis }
     private static var animationFrameMillis: Int { markerClusterAnimationFrameMillis }
@@ -88,6 +184,32 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
     public let zoomAnimationDurationMillis: Int
     public let cameraIdleDebounceMillis: Int
     public let debugHullPolygons: Bool
+    /// At or above this zoom, clicking a cluster fans its members out around
+    /// the (kept) cluster marker, connected by leg polylines — useful when
+    /// multiple markers share the same location and can never be separated by
+    /// zooming. Clicking the same cluster again, or any recluster (camera
+    /// move / data change), collapses the fan. Below this zoom the click
+    /// falls through to `onClusterClick`. `nil` disables the feature.
+    public let spiderfyMinZoom: Double?
+    /// Marker diameter in px used by the overlap-avoiding layout (default 52).
+    public let spiderfyMarkerSizePx: Double
+    /// Extra gap between fanned-out markers in px (default 8).
+    public let spiderfyMarkerMarginPx: Double
+    /// Leg polyline color (default #666666).
+    public let spiderfyLegColor: UIColor
+    /// Leg polyline width (default 1.5).
+    public let spiderfyLegWidth: Double
+    /// Called when a spiderfy fan opens (true) or collapses (false) — e.g. to
+    /// close an info bubble when the user clicks another cluster or the fan
+    /// is dismissed by a camera move.
+    public let onSpiderfyChange: ((Bool) -> Void)?
+    /// Called before newly appearing individual (non-cluster) markers are
+    /// rendered — e.g. when a cluster expands after a zoom. Rendering of the
+    /// new cluster state is deferred until the callback returns, so the app
+    /// can preload marker icon images (and show a loading indicator) before
+    /// the markers pop in. A newer recluster supersedes any pending deferred
+    /// apply.
+    public let prepareExpand: (([MarkerState]) async -> Void)?
 
     /// Called synchronously before marker animations start, after cluster computation.
     /// Set via ``MarkerClusterGroupState/bindPolygonSync(_:)`` to commit hull polygon
@@ -110,6 +232,18 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 
     private let debugInfoSubject = CurrentValueSubject<[MarkerClusterDebugInfo], Never>([])
     public var debugInfoFlow: CurrentValueSubject<[MarkerClusterDebugInfo], Never> { debugInfoSubject }
+    /// Leg polylines of the currently open spiderfy fan (empty when collapsed).
+    /// ``MarkerClusterGroupState`` republishes this so `MarkerClusterGroup` can
+    /// render the legs declaratively, the same way debug circles are rendered.
+    private let spiderfyLegsSubject = CurrentValueSubject<[PolylineState], Never>([])
+    public var spiderfyLegsFlow: CurrentValueSubject<[PolylineState], Never> { spiderfyLegsSubject }
+    // Spiderfy runtime state. Only touched from @MainActor methods
+    // (trySpiderfy / applySpiderfy / collapseSpiderfy) and clear()'s MainActor task.
+    private var spiderfyClusterKey: String?
+    private var spiderfyEntities: [MarkerEntity<ActualMarker>] = []
+    // Monotonic token: collapsing (or a newer open) invalidates an apply that is
+    // still waiting on prepareExpand, so a stale fan is never rendered.
+    private var spiderfyToken: Int = 0
     private var lastClusterMemberCenters: [String: GeoPoint] = [:]
     private var lastClusterPositions: [String: GeoPoint] = [:]
     private var lastRenderCameraPosition: MapCameraPosition?
@@ -137,6 +271,13 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         cameraIdleDebounceMillis: Int = DEFAULT_CAMERA_DEBOUNCE_MILLIS,
         tileSize: Double = DEFAULT_TILE_SIZE,
         debugHullPolygons: Bool = false,
+        spiderfyMinZoom: Double? = nil,
+        spiderfyMarkerSizePx: Double = DEFAULT_SPIDERFY_MARKER_SIZE_PX,
+        spiderfyMarkerMarginPx: Double = DEFAULT_SPIDERFY_MARKER_MARGIN_PX,
+        spiderfyLegColor: UIColor = DEFAULT_SPIDERFY_LEG_COLOR,
+        spiderfyLegWidth: Double = DEFAULT_SPIDERFY_LEG_WIDTH,
+        onSpiderfyChange: ((Bool) -> Void)? = nil,
+        prepareExpand: (([MarkerState]) async -> Void)? = nil,
         semaphore: AsyncSemaphore = AsyncSemaphore(1)
     ) {
         self.clusterRadiusPx = clusterRadiusPx
@@ -151,6 +292,13 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         self.cameraIdleDebounceMillis = cameraIdleDebounceMillis
         self.tileSize = tileSize
         self.debugHullPolygons = debugHullPolygons
+        self.spiderfyMinZoom = spiderfyMinZoom
+        self.spiderfyMarkerSizePx = spiderfyMarkerSizePx
+        self.spiderfyMarkerMarginPx = spiderfyMarkerMarginPx
+        self.spiderfyLegColor = spiderfyLegColor
+        self.spiderfyLegWidth = spiderfyLegWidth
+        self.onSpiderfyChange = onSpiderfyChange
+        self.prepareExpand = prepareExpand
         super.init(semaphore: semaphore)
     }
 
@@ -194,7 +342,14 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         renderTask = nil
 
         Task { @MainActor [weak self] in
-            self?.rendererBox.set(nil)
+            guard let self else { return }
+            self.rendererBox.set(nil)
+            // Reset spiderfy bookkeeping; a pending prepareExpand-deferred apply
+            // is invalidated by the token bump.
+            self.spiderfyToken += 1
+            self.spiderfyClusterKey = nil
+            self.spiderfyEntities = []
+            self.spiderfyLegsSubject.value = []
         }
 
         // Clear state
@@ -229,13 +384,20 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 	        viewport: GeoRectBounds,
 	        renderer: Renderer
 	    ) async -> Bool where Renderer.ActualMarker == ActualMarker {
-        guard let cameraPosition = lastCameraPosition else { return true }
         MCLog.marker("MarkerClusterStrategy[\(instanceId)].onAdd count=\(data.count)")
         lastViewport = viewport
 	        updateSourceStates(data)
 	        await MainActor.run { [weak self] in
 	            guard let self else { return }
 	            self.rendererBox.set(AnyMarkerOverlayRenderer(renderer))
+	        }
+        // A strategy can be attached after the native map is already loaded (the RN
+        // extension path does this). In that case marker ingestion and the initial camera
+        // callback are scheduled independently. Keep the source markers even when the
+        // camera has not arrived yet; onCameraChanged will render them once it does.
+        guard let cameraPosition = lastCameraPosition else { return true }
+	        await MainActor.run { [weak self] in
+	            guard let self else { return }
 	            self.enqueueRender(cameraPosition: cameraPosition, viewport: viewport, token: self.currentToken())
 	        }
 	        return true
@@ -415,6 +577,16 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                 (enableZoomAnimation && zoomChanged) ||
                 (enablePanAnimation && cameraMoved)
 	        MCLog.marker("MarkerClusterStrategy[\(instanceId)].renderClusters token=\(token) zoom=\(zoom) animate=\(animateTransitions)")
+
+            // Any effective recluster input change (zoom change / camera pan /
+            // source data change / forced) collapses an open spiderfy fan,
+            // matching the React SDK where every recluster collapses it. A
+            // content re-attachment with unchanged inputs (e.g. the SwiftUI
+            // re-render triggered by opening the fan itself) must not collapse.
+            if forced || zoomChanged || cameraMoved
+                || sourceStateVersionSnapshot != lastSourceStateVersionSnapshot {
+                await collapseSpiderfy()
+            }
 
             if zoomChanged,
                let lastRendered = lastRenderCameraPositionSnapshot,
@@ -661,27 +833,27 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                 if token != currentToken() { return }
                 if merged.members.count >= minClusterSize {
                     // Compute hull once; reuse for both centroid and debug visualization.
+                    // Degenerate hulls (all members at nearly the same point) fall back
+                    // to the member average, so a same-venue cluster is rendered exactly
+                    // at that venue rather than at the first member / a cached position.
                     let hull = convexHullProjected(members: merged.members, zoom: zoom)
                     let centroidPoint = polygonCentroidProjected(hull)
-                    let initialCenter: GeoPoint = centroidPoint
+                    let center: GeoPoint = centroidPoint
                         .map { unprojectFromPixel(x: $0.x, y: $0.y, zoom: zoom) }
-                        ?? merged.center
-                    let (cx, cy) = projectToPixel(position: initialCenter, zoom: zoom, tileSize: tileSize)
+                        ?? averageGeoPoints(points: merged.members.map { GeoPoint.from(position: $0.position) })
+
+                    // The rendered center is recomputed from the CURRENT members on
+                    // every recluster (camera idle). Membership-stable pans therefore
+                    // yield the identical centroid — no flicker — while membership
+                    // changes move the cluster to its true center instead of freezing
+                    // it at a stale cached position.
+                    let (cx, cy) = projectToPixel(position: center, zoom: zoom, tileSize: tileSize)
                     let cell = ClusterCell(
                         x: Int(floor(cx / effectiveRadiusPx)),
                         y: Int(floor(cy / effectiveRadiusPx))
                     )
                     let clusterId = buildClusterId(cell: cell, zoom: zoom)
 
-                    // Reuse cached position during panning when source hasn't changed.
-                    let center: GeoPoint
-                    if let cachedPosition = lastClusterPositionsSnapshot[clusterId],
-                       !zoomChanged,
-                       sourceStateVersionSnapshot == lastSourceStateVersionSnapshot {
-                        center = cachedPosition
-                    } else {
-                        center = initialCenter
-                    }
                     let radiusMeters = calculateClusterRadiusMeters(center: center, members: merged.members)
                     let cluster = MarkerCluster(
                         count: merged.members.count,
@@ -708,17 +880,20 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                     let icon =
                         clusterIconProviderWithTurn?(merged.members.count, turn) ??
                         clusterIconProvider(merged.members.count)
+                    // Cluster clicks first try spiderfy (when configured & zoomed in
+                    // enough), then fall through to the app's onClusterClick.
+                    let clusterClickable = onClusterClick != nil || spiderfyMinZoom != nil
                     let clusterState = MarkerState(
                         position: center,
                         id: clusterId,
                         extra: cluster,
                         icon: icon,
                         animation: nil,
-                        clickable: onClusterClick != nil,
+                        clickable: clusterClickable,
                         draggable: false,
-                        onClick: onClusterClick != nil ? { [weak self] _ in
+                        onClick: clusterClickable ? { [weak self] _ in
                             guard let self else { return }
-                            self.onClusterClick?(cluster)
+                            self.handleClusterClick(cluster)
                         } : nil,
                         onDragStart: nil,
                         onDrag: nil,
@@ -805,6 +980,20 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 	        // Commit hull polygon updates before animation starts so polygon rendering
 	        // and marker animation cannot race each other.
 	        await onBeforeAnimation?(debugInfos)
+	        // Keep the current (clustered) rendering on screen until the app finishes
+	        // preparing the newly appearing individual markers (e.g. icon preloading).
+	        // A newer camera update increments the token while we wait, superseding
+	        // this apply so a stale cluster state is never rendered.
+	        if let prepareExpand {
+	            let appearing = desiredStates.filter { state in
+	                !state.id.hasPrefix("cluster_") && markerManager.getEntity(state.id) == nil
+	            }
+	            if !appearing.isEmpty {
+	                await prepareExpand(appearing)
+	                if Task.isCancelled { return }
+	                if token != currentToken() { return }
+	            }
+	        }
 	        await updateRenderedMarkers(
 	            desiredStates: desiredStates,
 	            renderer: renderer,
@@ -828,16 +1017,22 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 	        previousClusterPositions: [String: GeoPoint],
 	        nextClusterPositions: [String: GeoPoint]
 	    ) async {
-	        // Early return check at start
+	        // If polygon synchronization allowed a newer camera update to arrive,
+	        // reconcile this result without animation instead of returning and leaving
+	        // the previously rendered markers on the provider map.
 	        if Task.isCancelled { return }
-	        if token != currentToken() { return }
+	        let animationIsCurrent = token == currentToken()
 
         var desiredById: [String: MarkerState] = [:]
         for state in desiredStates {
             desiredById[state.id] = state
         }
-        let animateZoom = animateTransitions && zoomAnimationDurationMillis > 0
+        let animateZoom = animateTransitions && zoomAnimationDurationMillis > 0 && animationIsCurrent
+        // Spiderfy markers are managed by trySpiderfy/collapseSpiderfy, never by
+        // the cluster diff — exclude them so a recluster does not remove them
+        // behind the fan's back (collapseSpiderfy owns their lifecycle).
         let existing = markerManager.allEntities()
+            .filter { !$0.state.id.hasPrefix(spiderfyMarkerIdPrefix) }
         var existingById: [String: MarkerEntity<ActualMarker>] = [:]
         for entity in existing {
             existingById[entity.state.id] = entity
@@ -850,15 +1045,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             let orphanedEntitiesBeforeAnimation = orphanedIds.compactMap { renderedMarkerEntities[$0] }
             renderStateLock.unlock()
             if !orphanedEntitiesBeforeAnimation.isEmpty {
-                // Check cancellation before renderer call
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
-
                 await renderer.onRemove(data: orphanedEntitiesBeforeAnimation)
-
-                // Check cancellation immediately after renderer call
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
 
                 renderStateLock.lock()
                 for entity in orphanedEntitiesBeforeAnimation {
@@ -867,19 +1054,12 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                 }
                 renderStateLock.unlock()
 
-                // Check cancellation before renderer call
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
-
                 await renderer.onPostProcess()
-
-                // Check cancellation immediately after renderer call
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
             }
         }
 
         let existingAfterCleanup = markerManager.allEntities()
+            .filter { !$0.state.id.hasPrefix(spiderfyMarkerIdPrefix) }
         var existingByIdAfterCleanup: [String: MarkerEntity<ActualMarker>] = [:]
         for entity in existingAfterCleanup {
             existingByIdAfterCleanup[entity.state.id] = entity
@@ -941,19 +1121,11 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
 
         var didImmediateChange = false
         if !immediateRemoveIds.isEmpty {
-            // Check cancellation before renderer call
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
-
             renderStateLock.lock()
             let removedEntities = immediateRemoveIds.compactMap { renderedMarkerEntities[$0] }
             renderStateLock.unlock()
             if !removedEntities.isEmpty {
                 await renderer.onRemove(data: removedEntities)
-
-                // Check cancellation immediately after renderer call
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
 
                 renderStateLock.lock()
                 for entity in removedEntities {
@@ -966,10 +1138,6 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         }
 
         if !immediateAddStates.isEmpty {
-            // Check cancellation before renderer call
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
-
             let addParams = immediateAddStates.map { state in
                 MarkerOverlayAddParams(
                     state: state,
@@ -977,10 +1145,6 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                 )
             }
             let actualMarkers = await renderer.onAdd(data: addParams)
-
-            // Check cancellation immediately after renderer call
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
 
             for (index, actualMarker) in actualMarkers.enumerated() {
                 guard let actualMarker else { continue }
@@ -1025,15 +1189,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         }
 
         if !changeParams.isEmpty {
-            // Check cancellation before renderer call
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
-
             let actualMarkers = await renderer.onChange(data: changeParams)
-
-            // Check cancellation immediately after renderer call
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
 
             for (index, actualMarker) in actualMarkers.enumerated() {
                 guard let actualMarker else { continue }
@@ -1052,24 +1208,12 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         }
 
         if didImmediateChange {
-            // Check cancellation before renderer call
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
-
             await renderer.onPostProcess()
-
-            // Check cancellation immediately after renderer call
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
         }
 
         if !animateZoom || (animatedRemoveEntries.isEmpty && animatedAddEntries.isEmpty) {
             return
         }
-
-        // Early return check before animation
-        if Task.isCancelled { return }
-        if token != currentToken() { return }
 
         let animatedStartEntities: [MarkerEntity<ActualMarker>]
         if !animatedAddEntries.isEmpty {
@@ -1078,15 +1222,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             }
             animatedStartEntities = await addStatesToRenderer(states: animatedStartStates, renderer: renderer)
 
-            // Check cancellation before renderer call
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
-
             await renderer.onPostProcess()
-
-            // Check cancellation immediately after renderer call
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
         } else {
             animatedStartEntities = []
         }
@@ -1123,15 +1259,11 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             token: token
         )
 
-        // Early return check after animation
-        if Task.isCancelled { return }
-        if token != currentToken() { return }
-
+        // Match Android's cancellation semantics: even when a newer camera update
+        // invalidates this animation, the markers participating in this transition
+        // must be removed. Returning here leaves the outgoing cluster markers (and
+        // potentially the temporary incoming markers) on the map indefinitely.
         if !animatedRemoveEntries.isEmpty {
-            // Check cancellation before cleanup
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
-
             let entitiesToRemove = animatedRemoveEntries
                 .map { $0.entity }
                 .filter { entity in
@@ -1143,10 +1275,6 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             if !entitiesToRemove.isEmpty {
                 await renderer.onRemove(data: entitiesToRemove)
 
-                // Check cancellation immediately after renderer call
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
-
                 renderStateLock.lock()
                 for entity in entitiesToRemove {
                     renderedMarkerEntities.removeValue(forKey: entity.state.id)
@@ -1155,10 +1283,6 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                 renderStateLock.unlock()
 
                 await renderer.onPostProcess()
-
-                // Check cancellation immediately after renderer call
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
             }
         }
 
@@ -1173,10 +1297,6 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
             if !entitiesToRemoveOnCancel.isEmpty {
                 await renderer.onRemove(data: entitiesToRemoveOnCancel)
 
-                // Check cancellation immediately after renderer call
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
-
                 renderStateLock.lock()
                 for entity in entitiesToRemoveOnCancel {
                     renderedMarkerEntities.removeValue(forKey: entity.state.id)
@@ -1185,10 +1305,6 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                 renderStateLock.unlock()
 
                 await renderer.onPostProcess()
-
-                // Check cancellation immediately after renderer call (final)
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
             }
         }
     }
@@ -1285,15 +1401,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                 changeEntities.append(nextEntity)
             }
             if !changeParams.isEmpty {
-                // Additional check before renderer call in animation loop
-                if token != currentToken() { return false }
-                if Task.isCancelled { return false }
-
                 let actualMarkers = await renderer.onChange(data: changeParams)
-
-                // Check cancellation immediately after renderer call
-                if token != currentToken() { return false }
-                if Task.isCancelled { return false }
 
                 for (index, actualMarker) in actualMarkers.enumerated() {
                     let fallbackMarker = activeMoves[index].entity.marker
@@ -1311,15 +1419,7 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
                 activeMoves[index].entity = updatedEntity
             }
 
-                // Check cancellation before renderer call
-                if token != currentToken() { return false }
-                if Task.isCancelled { return false }
-
                 await renderer.onPostProcess()
-
-                // Check cancellation immediately after renderer call
-                if token != currentToken() { return false }
-                if Task.isCancelled { return false }
             }
             if step < steps {
                 let nanos = UInt64(stepMillis) * 1_000_000
@@ -1701,6 +1801,177 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         renderStateLock.unlock()
         let token = incrementToken()
         enqueueRender(cameraPosition: cameraPosition, viewport: viewport, token: token)
+    }
+
+    // ── Spiderfy (click-to-fan-out) ──────────────────────────────────────────
+
+    /// Cluster clicks first try spiderfy (when configured & zoomed in enough),
+    /// then fall through to the app's `onClusterClick`.
+    private func handleClusterClick(_ cluster: MarkerCluster) {
+        guard spiderfyMinZoom != nil else {
+            onClusterClick?(cluster)
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if await self.trySpiderfy(cluster: cluster) { return }
+            self.onClusterClick?(cluster)
+        }
+    }
+
+    /// Fans the cluster's members out around the (kept) cluster marker, or
+    /// collapses the fan when the same cluster is clicked again. Returns
+    /// `false` when spiderfy does not apply (disabled, below `spiderfyMinZoom`,
+    /// or no members) so the click can fall through to `onClusterClick`.
+    @MainActor
+    private func trySpiderfy(cluster: MarkerCluster) async -> Bool {
+        guard let spiderfyMinZoom else { return false }
+        guard let camera = lastCameraPosition, camera.zoom >= spiderfyMinZoom else { return false }
+
+        let clusterKey = cluster.markerIds.sorted().joined(separator: ",")
+        if spiderfyClusterKey == clusterKey {
+            await collapseSpiderfy()
+            return true
+        }
+        await collapseSpiderfy()
+
+        let zoom = camera.zoom
+        sourceStatesLock.lock()
+        let members = cluster.markerIds.compactMap { sourceStates[$0] }
+        sourceStatesLock.unlock()
+        guard !members.isEmpty else { return false }
+
+        // 展開・脚線の中心はクラスタマーカーの「実際の描画位置」を使う。
+        // (描画位置がメンバー平均からずれていても脚線がピンの根元に刺さる)
+        var centerGeo = averageGeoPoints(points: members.map { GeoPoint.from(position: $0.position) })
+        renderStateLock.lock()
+        let renderedStates = renderedMarkerEntities.values.map { $0.state }
+        renderStateLock.unlock()
+        for state in renderedStates {
+            if let extra = state.extra as? MarkerCluster, extra == cluster {
+                centerGeo = GeoPoint.from(position: state.position)
+                break
+            }
+        }
+        let (centerX, centerY) = projectToPixel(position: centerGeo, zoom: zoom, tileSize: tileSize)
+
+        // 周囲に既に描画されている出力マーカー(他クラスタ・他の個別マーカー)を
+        // 障害物として渡し、展開メンバーが重ならないようにする。
+        // クリックされたクラスタ自身(中心とほぼ同位置)は除外し、代わりに
+        // ピン形クラスタの頭部を疑似障害物として加える
+        var obstacles: [SpiderfyOffset] = []
+        for state in renderedStates {
+            let (px, py) = projectToPixel(position: state.position, zoom: zoom, tileSize: tileSize)
+            let rel = SpiderfyOffset(x: px - centerX, y: py - centerY)
+            let d = hypot(rel.x, rel.y)
+            if d < 2 || d > 300 { continue } // 自分自身 or 遠すぎるものは無視
+            obstacles.append(rel)
+        }
+        obstacles.append(SpiderfyOffset(x: 0, y: -(spiderfyMarkerSizePx / 2.0).rounded()))
+
+        let offsets = spiderfyLayout(
+            count: members.count,
+            markerSizePx: spiderfyMarkerSizePx,
+            marginPx: spiderfyMarkerMarginPx,
+            obstacles: obstacles
+        )
+        var clones: [MarkerState] = []
+        var legs: [PolylineState] = []
+        for (index, member) in members.enumerated() {
+            let geo = unprojectFromPixel(
+                x: centerX + offsets[index].x,
+                y: centerY + offsets[index].y,
+                zoom: zoom
+            )
+            clones.append(member.copy(
+                id: "\(spiderfyMarkerIdPrefix)\(member.id)",
+                position: geo,
+                zIndex: 2000
+            ))
+            legs.append(PolylineState(
+                points: [centerGeo, geo],
+                id: "\(spiderfyLegIdPrefix)\(member.id)",
+                strokeColor: spiderfyLegColor,
+                strokeWidth: spiderfyLegWidth,
+                geodesic: false
+            ))
+        }
+        guard !clones.isEmpty else { return false }
+
+        if let prepareExpand {
+            // Defer rendering the fan until the app finishes preparing the
+            // appearing markers (e.g. icon preloading). A collapse or a newer
+            // open supersedes this pending apply via the token.
+            spiderfyToken += 1
+            let token = spiderfyToken
+            Task { @MainActor [weak self] in
+                await prepareExpand(clones)
+                guard let self, self.spiderfyToken == token else { return }
+                await self.applySpiderfy(clusterKey: clusterKey, clones: clones, legs: legs)
+            }
+        } else {
+            await applySpiderfy(clusterKey: clusterKey, clones: clones, legs: legs)
+        }
+        return true
+    }
+
+    @MainActor
+    private func applySpiderfy(
+        clusterKey: String,
+        clones: [MarkerState],
+        legs: [PolylineState]
+    ) async {
+        guard let renderer = rendererBox.get() else { return }
+        let addParams = clones.map { state in
+            MarkerOverlayAddParams(
+                state: state,
+                bitmapIcon: state.icon?.toBitmapIcon() ?? defaultMarkerIcon
+            )
+        }
+        let actualMarkers = await renderer.onAdd(data: addParams)
+        var entities: [MarkerEntity<ActualMarker>] = []
+        for (index, actualMarker) in actualMarkers.enumerated() {
+            guard let actualMarker else { continue }
+            let entity = MarkerEntity(
+                marker: actualMarker,
+                state: addParams[index].state,
+                visible: true,
+                isRendered: true
+            )
+            // Register in markerManager so the provider's tap dispatch can resolve
+            // the clone's state (member onClick still fires on the fanned marker),
+            // but keep it OUT of renderedMarkerEntities so the cluster diff and
+            // stale-marker cleanup never touch it.
+            markerManager.registerEntity(entity)
+            entities.append(entity)
+        }
+        await renderer.onPostProcess()
+        spiderfyEntities = entities
+        spiderfyClusterKey = clusterKey
+        spiderfyLegsSubject.value = legs
+        onSpiderfyChange?(true)
+        MCLog.marker("MarkerClusterStrategy[\(instanceId)].spiderfy open count=\(entities.count)")
+    }
+
+    /// Collapses an open spiderfy fan and invalidates any apply still waiting
+    /// on `prepareExpand`.
+    @MainActor
+    private func collapseSpiderfy() async {
+        spiderfyToken += 1
+        guard spiderfyClusterKey != nil else { return }
+        spiderfyClusterKey = nil
+        let entities = spiderfyEntities
+        spiderfyEntities = []
+        spiderfyLegsSubject.value = []
+        if !entities.isEmpty, let renderer = rendererBox.get() {
+            await renderer.onRemove(data: entities)
+            for entity in entities {
+                _ = markerManager.removeEntity(entity.state.id)
+            }
+            await renderer.onPostProcess()
+        }
+        onSpiderfyChange?(false)
+        MCLog.marker("MarkerClusterStrategy[\(instanceId)].spiderfy collapse")
     }
 
     public static var defaultIconProvider: ClusterIconProvider {

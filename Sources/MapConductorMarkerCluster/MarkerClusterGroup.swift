@@ -51,7 +51,10 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
     ) {
         self.strategy = AnyMarkerRenderingStrategy(strategy)
         self.markers = markers
-        self.overlayContent = MapViewContent()
+        var content = MapViewContent()
+        // Current spiderfy leg polylines (snapshot at build time).
+        content.polylines = strategy.spiderfyLegsFlow.value.map { Polyline(state: $0) }
+        self.overlayContent = content
         self.polygonSyncHandler = nil
     }
 
@@ -61,7 +64,11 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
     ) {
         self.strategy = AnyMarkerRenderingStrategy(state.strategy(for: ActualMarker.self))
         self.markers = markers
-        self.overlayContent = MapViewContent()
+        var content = MapViewContent()
+        // Spiderfy leg polylines are published by the state, so SwiftUI re-renders
+        // the map content when a fan opens/collapses (same idiom as debug circles).
+        content.polylines = state.spiderfyLegs.map { Polyline(state: $0) }
+        self.overlayContent = content
         self.polygonSyncHandler = state
     }
 
@@ -77,6 +84,13 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
         zoomAnimationDurationMillis: Int = MarkerClusterStrategy<ActualMarker>.DEFAULT_ZOOM_ANIMATION_DURATION_MILLIS,
         cameraIdleDebounceMillis: Int = MarkerClusterStrategy<ActualMarker>.DEFAULT_CAMERA_DEBOUNCE_MILLIS,
         tileSize: Double = MarkerClusterStrategy<ActualMarker>.DEFAULT_TILE_SIZE,
+        prepareExpand: (([MarkerState]) async -> Void)? = nil,
+        spiderfyMinZoom: Double? = nil,
+        spiderfyMarkerSizePx: Double = MarkerClusterStrategy<ActualMarker>.DEFAULT_SPIDERFY_MARKER_SIZE_PX,
+        spiderfyMarkerMarginPx: Double = MarkerClusterStrategy<ActualMarker>.DEFAULT_SPIDERFY_MARKER_MARGIN_PX,
+        spiderfyLegColor: UIColor = MarkerClusterStrategy<ActualMarker>.DEFAULT_SPIDERFY_LEG_COLOR,
+        spiderfyLegWidth: Double = MarkerClusterStrategy<ActualMarker>.DEFAULT_SPIDERFY_LEG_WIDTH,
+        onSpiderfyChange: ((Bool) -> Void)? = nil,
         @MapViewContentBuilder content: () -> MapViewContent
     ) {
         self.init(
@@ -91,7 +105,14 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
                 enablePanAnimation: enablePanAnimation,
                 zoomAnimationDurationMillis: zoomAnimationDurationMillis,
                 cameraIdleDebounceMillis: cameraIdleDebounceMillis,
-                tileSize: tileSize
+                tileSize: tileSize,
+                spiderfyMinZoom: spiderfyMinZoom,
+                spiderfyMarkerSizePx: spiderfyMarkerSizePx,
+                spiderfyMarkerMarginPx: spiderfyMarkerMarginPx,
+                spiderfyLegColor: spiderfyLegColor,
+                spiderfyLegWidth: spiderfyLegWidth,
+                onSpiderfyChange: onSpiderfyChange,
+                prepareExpand: prepareExpand
             ),
             content: content
         )
@@ -114,6 +135,9 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
         passthrough.markers = []
         passthrough.markerRenderingStrategy = nil
         passthrough.markerRenderingMarkers = []
+
+        // Current spiderfy leg polylines (snapshot at build time).
+        passthrough.polylines.append(contentsOf: strategy.spiderfyLegsFlow.value.map { Polyline(state: $0) })
 
         // Hull polygons are managed imperatively via onBeforeAnimation; skip declarative build.
         self.overlayContent = passthrough
@@ -156,6 +180,10 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
             }
             passthrough.circles.append(contentsOf: circles)
         }
+
+        // Spiderfy leg polylines are published by the state, so SwiftUI re-renders
+        // the map content when a fan opens/collapses (same idiom as debug circles).
+        passthrough.polylines.append(contentsOf: state.spiderfyLegs.map { Polyline(state: $0) })
 
         // Hull polygons are managed imperatively via the state so they can also be
         // cleared when debugHullPolygons is turned off.

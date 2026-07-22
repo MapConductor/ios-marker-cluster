@@ -10,6 +10,7 @@ import UIKit
 public final class MarkerClusterGroupState: ObservableObject {
     public typealias ClusterIconProvider = (Int) -> MarkerIconProtocol
     public typealias ClusterIconProviderWithTurn = (Int, Int) -> MarkerIconProtocol
+    public typealias PrepareExpand = ([MarkerState]) async -> Void
 
     @Published public var clusterRadiusPx: Double { didSet { rebuildStrategies() } }
     @Published public var minClusterSize: Int { didSet { rebuildStrategies() } }
@@ -22,6 +23,20 @@ public final class MarkerClusterGroupState: ObservableObject {
     @Published public var zoomAnimationDurationMillis: Int { didSet { rebuildStrategies() } }
     @Published public var cameraIdleDebounceMillis: Int { didSet { rebuildStrategies() } }
     @Published public var tileSize: Double { didSet { rebuildStrategies() } }
+    /// 展開直前に新しく出現する個別マーカーを引数に呼ばれる非同期コールバック。
+    /// 戻るまで新しいクラスタ状態の描画を遅延するので、アイコンの事前読み込み等に使えます。
+    @Published public var prepareExpand: PrepareExpand? { didSet { rebuildStrategies() } }
+    /// このズーム以上でクラスタをクリックすると、メンバーをクラスタマーカーの周囲に
+    /// 扇状展開(spiderfy)します。`nil` で無効。
+    @Published public var spiderfyMinZoom: Double? { didSet { rebuildStrategies() } }
+    @Published public var spiderfyMarkerSizePx: Double { didSet { rebuildStrategies() } }
+    @Published public var spiderfyMarkerMarginPx: Double { didSet { rebuildStrategies() } }
+    @Published public var spiderfyLegColor: UIColor { didSet { rebuildStrategies() } }
+    @Published public var spiderfyLegWidth: Double { didSet { rebuildStrategies() } }
+    /// spiderfy の展開(true)/収納(false)時に呼ばれます。
+    @Published public var onSpiderfyChange: ((Bool) -> Void)? { didSet { rebuildStrategies() } }
+    /// 現在開いている spiderfy の脚線。`MarkerClusterGroup` が宣言的に描画します。
+    @Published public private(set) var spiderfyLegs: [PolylineState] = []
 
     @Published public var debugClusterTurnLabel: Bool = false
     @Published public var showClusterRadiusCircle: Bool = false
@@ -56,6 +71,7 @@ public final class MarkerClusterGroupState: ObservableObject {
     // Recreates each cached strategy with its original ActualMarker type after a config change.
     private var strategyRebuilders: [ObjectIdentifier: () -> Void] = [:]
     private var debugInfoCancellables: [ObjectIdentifier: AnyCancellable] = [:]
+    private var spiderfyLegCancellables: [ObjectIdentifier: AnyCancellable] = [:]
     // Stored so config changes and rebinds can re-apply it to every strategy instance.
     private var polygonSyncFn: (@MainActor ([PolygonState]) async -> Void)?
 
@@ -71,7 +87,14 @@ public final class MarkerClusterGroupState: ObservableObject {
         zoomAnimationDurationMillis: Int = MarkerClusterDefaults.zoomAnimationDurationMillis,
         cameraIdleDebounceMillis: Int = MarkerClusterDefaults.cameraIdleDebounceMillis,
         tileSize: Double = MarkerClusterDefaults.tileSize,
-        debugHullPolygons: Bool = false
+        debugHullPolygons: Bool = false,
+        prepareExpand: PrepareExpand? = nil,
+        spiderfyMinZoom: Double? = nil,
+        spiderfyMarkerSizePx: Double = MarkerClusterDefaults.spiderfyMarkerSizePx,
+        spiderfyMarkerMarginPx: Double = MarkerClusterDefaults.spiderfyMarkerMarginPx,
+        spiderfyLegColor: UIColor = MarkerClusterDefaults.spiderfyLegColor,
+        spiderfyLegWidth: Double = MarkerClusterDefaults.spiderfyLegWidth,
+        onSpiderfyChange: ((Bool) -> Void)? = nil
     ) {
         self.clusterRadiusPx = clusterRadiusPx
         self.minClusterSize = minClusterSize
@@ -84,6 +107,13 @@ public final class MarkerClusterGroupState: ObservableObject {
         self.zoomAnimationDurationMillis = zoomAnimationDurationMillis
         self.cameraIdleDebounceMillis = cameraIdleDebounceMillis
         self.tileSize = tileSize
+        self.prepareExpand = prepareExpand
+        self.spiderfyMinZoom = spiderfyMinZoom
+        self.spiderfyMarkerSizePx = spiderfyMarkerSizePx
+        self.spiderfyMarkerMarginPx = spiderfyMarkerMarginPx
+        self.spiderfyLegColor = spiderfyLegColor
+        self.spiderfyLegWidth = spiderfyLegWidth
+        self.onSpiderfyChange = onSpiderfyChange
         self.debugHullPolygons = debugHullPolygons
     }
 
@@ -116,7 +146,14 @@ public final class MarkerClusterGroupState: ObservableObject {
             zoomAnimationDurationMillis: zoomAnimationDurationMillis,
             cameraIdleDebounceMillis: cameraIdleDebounceMillis,
             tileSize: tileSize,
-            debugHullPolygons: debugHullPolygons
+            debugHullPolygons: debugHullPolygons,
+            spiderfyMinZoom: spiderfyMinZoom,
+            spiderfyMarkerSizePx: spiderfyMarkerSizePx,
+            spiderfyMarkerMarginPx: spiderfyMarkerMarginPx,
+            spiderfyLegColor: spiderfyLegColor,
+            spiderfyLegWidth: spiderfyLegWidth,
+            onSpiderfyChange: onSpiderfyChange,
+            prepareExpand: prepareExpand
         )
         strategies[key] = strategy
         strategyRebuilders[key] = { [weak self] in
@@ -124,6 +161,7 @@ public final class MarkerClusterGroupState: ObservableObject {
         }
         applyPolygonSync(to: strategy)
         bindDebugInfo(strategy, key: key)
+        bindSpiderfyLegs(strategy, key: key)
         return strategy
     }
 
@@ -131,6 +169,8 @@ public final class MarkerClusterGroupState: ObservableObject {
         strategies.values.forEach { $0.clear() }
         strategies.removeAll()
         debugInfoCancellables.removeAll()
+        spiderfyLegCancellables.removeAll()
+        spiderfyLegs = []
         // Recreate eagerly so MarkerClusterGroup picks up the new instances on the next build.
         strategyRebuilders.values.forEach { $0() }
     }
@@ -140,6 +180,14 @@ public final class MarkerClusterGroupState: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in
                 self?.debugInfos = $0
+            }
+    }
+
+    private func bindSpiderfyLegs(_ strategy: any MarkerClusterStrategyBase, key: ObjectIdentifier) {
+        spiderfyLegCancellables[key] = strategy.spiderfyLegsFlow
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                self?.spiderfyLegs = $0
             }
     }
 
