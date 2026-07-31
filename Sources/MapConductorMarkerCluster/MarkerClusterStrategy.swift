@@ -2119,29 +2119,6 @@ private final class MainQueueReleaseBox<T> {
     }
 }
 
-private func expandBounds(bounds: GeoRectBounds, margin: Double) -> GeoRectBounds {
-    if bounds.isEmpty { return bounds }
-    guard let span = bounds.toSpan(), let center = bounds.center else { return bounds }
-
-    let latMargin = span.latitude * margin / 2.0
-    let lonMargin = span.longitude * margin / 2.0
-
-    let expanded = GeoRectBounds()
-    expanded.extend(
-        point: GeoPoint(
-            latitude: center.latitude - span.latitude / 2.0 - latMargin,
-            longitude: center.longitude - span.longitude / 2.0 - lonMargin
-        )
-    )
-    expanded.extend(
-        point: GeoPoint(
-            latitude: center.latitude + span.latitude / 2.0 + latMargin,
-            longitude: center.longitude + span.longitude / 2.0 + lonMargin
-        )
-    )
-    return expanded
-}
-
 private enum Earth {
     static let radiusMeters: Double = 6371009.0
     static let circumferenceMeters: Double = 2.0 * Double.pi * radiusMeters
