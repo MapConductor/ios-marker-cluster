@@ -9,7 +9,6 @@ private let markerClusterDefaultExpandMargin: Double = 0.2
 private let markerClusterDefaultTileSize: Double = 256.0
 private let markerClusterDefaultZoomAnimationDurationMillis: Int = 300
 public let markerClusterCameraDebounceMillis: Int = 100
-private let markerClusterAnimationFrameMillis: Int = 16
 private let markerClusterMaxDenseCells: Int = 4
 private let markerClusterMaxDenseCandidates: Int = 50
 private let markerClusterPanAnimationMinDistanceMeters: Double = 1.0
@@ -158,7 +157,6 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
     public static var DEFAULT_SPIDERFY_LEG_WIDTH: Double { markerClusterDefaultSpiderfyLegWidth }
 
     private static var cameraDebounceMillis: Int { markerClusterCameraDebounceMillis }
-    private static var animationFrameMillis: Int { markerClusterAnimationFrameMillis }
     private static var maxDenseCells: Int { markerClusterMaxDenseCells }
     private static var maxDenseCandidates: Int { markerClusterMaxDenseCandidates }
     private static var panAnimationMinDistanceMeters: Double { markerClusterPanAnimationMinDistanceMeters }
@@ -278,7 +276,8 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         spiderfyLegWidth: Double = DEFAULT_SPIDERFY_LEG_WIDTH,
         onSpiderfyChange: ((Bool) -> Void)? = nil,
         prepareExpand: (([MarkerState]) async -> Void)? = nil,
-        semaphore: AsyncSemaphore = AsyncSemaphore(1)
+        semaphore: AsyncSemaphore = AsyncSemaphore(1),
+        geocell: HexGeocellProtocol = HexGeocell.defaultGeocell()
     ) {
         self.clusterRadiusPx = clusterRadiusPx
         self.minClusterSize = minClusterSize
@@ -299,7 +298,13 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         self.spiderfyLegWidth = spiderfyLegWidth
         self.onSpiderfyChange = onSpiderfyChange
         self.prepareExpand = prepareExpand
-        super.init(semaphore: semaphore)
+        // Android: `MarkerManager(geocell, 0)` — minMarkerCount 0 keeps the hex spatial
+        // index enabled from the first marker rather than only above MarkerManager's
+        // 2000 default, so cluster hit-testing behaves the same on both platforms.
+        super.init(
+            markerManager: MarkerManager(geocell: geocell, minMarkerCount: 0),
+            semaphore: semaphore
+        )
     }
 
     deinit {

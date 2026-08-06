@@ -125,7 +125,7 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
         let inner = content()
         var seenIds = Set<String>()
         let markerStates =
-            (inner.markerRenderingMarkers + inner.markers.map(\.state))
+            inner.markers.map(\.state)
             .filter { seenIds.insert($0.id).inserted }
 
         self.strategy = AnyMarkerRenderingStrategy(strategy)
@@ -133,8 +133,6 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
 
         var passthrough = inner
         passthrough.markers = []
-        passthrough.markerRenderingStrategy = nil
-        passthrough.markerRenderingMarkers = []
 
         // Current spiderfy leg polylines (snapshot at build time).
         passthrough.polylines.append(contentsOf: strategy.spiderfyLegsFlow.value.map { Polyline(state: $0) })
@@ -151,7 +149,7 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
         let inner = content()
         var seenIds = Set<String>()
         let markerStates =
-            (inner.markerRenderingMarkers + inner.markers.map(\.state))
+            inner.markers.map(\.state)
             .filter { seenIds.insert($0.id).inserted }
 
         self.strategy = AnyMarkerRenderingStrategy(state.strategy(for: ActualMarker.self))
@@ -159,27 +157,6 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
 
         var passthrough = inner
         passthrough.markers = []
-        passthrough.markerRenderingStrategy = nil
-        passthrough.markerRenderingMarkers = []
-
-        if state.showClusterRadiusCircle {
-            let circles = state.debugInfos.map { info in
-                Circle(
-                    center: info.center,
-                    radiusMeters: info.radiusMeters,
-                    geodesic: true,
-                    clickable: false,
-                    strokeColor: state.clusterRadiusStrokeColor,
-                    strokeWidth: state.clusterRadiusStrokeWidth,
-                    fillColor: state.clusterRadiusFillColor,
-                    id: "\(markerClusterGroupClusterCircleIdPrefix)\(info.id)",
-                    zIndex: nil,
-                    extra: info,
-                    onClick: nil
-                )
-            }
-            passthrough.circles.append(contentsOf: circles)
-        }
 
         // Spiderfy leg polylines are published by the state, so SwiftUI re-renders
         // the map content when a fan opens/collapses (same idiom as debug circles).
@@ -198,10 +175,28 @@ public struct MarkerClusterGroup<ActualMarker>: MapOverlayItemProtocol {
         content.circles.append(contentsOf: overlayContent.circles)
         content.rasterLayers.append(contentsOf: overlayContent.rasterLayers)
         content.views.append(contentsOf: overlayContent.views)
-        content.markerRenderingStrategy = strategy
-        content.markerRenderingMarkers = markers
+        connectToMarkerRendering()
         if let handler = polygonSyncHandler {
             content.polygonSyncHandlers.append(handler)
+        }
+    }
+
+    /// Resolves this map's marker-rendering capability and drives it with our strategy.
+    ///
+    /// Mirrors Android's `MarkerRenderingGroup`, which reads `MarkerRenderingSupportKey`
+    /// out of `LocalMapServiceRegistry` rather than having the provider reach into the
+    /// content for a clustering-shaped field. When no provider registered the capability
+    /// (or its marker type does not match ours) this is a no-op, exactly as the Android
+    /// composable returns early on a missing key.
+    private func connectToMarkerRendering() {
+        // Map content is always assembled on the main actor — the provider evaluates its
+        // content closure inside `body`, which is also where the registry scope is
+        // installed. `append(to:)` itself cannot be `@MainActor` because
+        // `MapOverlayItemProtocol` is shared with overlay items that are not isolated.
+        MainActor.assumeIsolated {
+            guard let support = MapServiceRegistryScope.current.get(MarkerRenderingSupportKey.self)
+            else { return }
+            support.connect(strategy: strategy, markers: markers)
         }
     }
 }

@@ -2,6 +2,12 @@ import Combine
 import MapConductorCore
 import UIKit
 
+// Debug hull polygon styling. Fixed rather than configurable: `debugHullPolygons`
+// is the only debug knob the public API exposes on all three platforms.
+private let markerClusterDebugHullStrokeWidth: Double = 2.0
+private let markerClusterDebugHullStrokeAlpha: CGFloat = 0.8
+private let markerClusterDebugHullFillAlpha: CGFloat = 0.18
+
 /// Android SDK の `MarkerClusterGroupState` に対応する iOS 側の State コンテナです。
 /// Android と同様にジェネリクスを持たない設定ホルダーで、プロバイダごとの
 /// `MarkerClusterStrategy<ActualMarker>` は ``strategy(for:)`` で遅延生成・キャッシュします。
@@ -38,11 +44,6 @@ public final class MarkerClusterGroupState: ObservableObject {
     /// 現在開いている spiderfy の脚線。`MarkerClusterGroup` が宣言的に描画します。
     @Published public private(set) var spiderfyLegs: [PolylineState] = []
 
-    @Published public var debugClusterTurnLabel: Bool = false
-    @Published public var showClusterRadiusCircle: Bool = false
-    @Published public var clusterRadiusStrokeColor: UIColor = .red
-    @Published public var clusterRadiusStrokeWidth: Double = 1.0
-    @Published public var clusterRadiusFillColor: UIColor = .clear
     @Published public var debugHullPolygons: Bool = false {
         didSet {
             guard debugHullPolygons != oldValue else { return }
@@ -62,9 +63,6 @@ public final class MarkerClusterGroupState: ObservableObject {
             }
         }
     }
-    @Published public var debugHullStrokeWidth: Double = 2.0
-    @Published public var debugHullStrokeAlpha: Float = 0.8
-    @Published public var debugHullFillAlpha: Float = 0.18
     @Published public private(set) var debugInfos: [MarkerClusterDebugInfo] = []
 
     private var strategies: [ObjectIdentifier: any MarkerClusterStrategyBase] = [:]
@@ -196,9 +194,9 @@ public final class MarkerClusterGroupState: ObservableObject {
             strategy.onBeforeAnimation = nil
             return
         }
-        let strokeAlpha = CGFloat(debugHullStrokeAlpha)
-        let fillAlpha = CGFloat(debugHullFillAlpha)
-        let strokeWidth = debugHullStrokeWidth
+        let strokeAlpha = markerClusterDebugHullStrokeAlpha
+        let fillAlpha = markerClusterDebugHullFillAlpha
+        let strokeWidth = markerClusterDebugHullStrokeWidth
         strategy.onBeforeAnimation = { debugInfos in
             let states = makeHullPolygonStates(
                 from: debugInfos,
