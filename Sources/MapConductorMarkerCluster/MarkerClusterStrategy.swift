@@ -3,147 +3,31 @@ import Foundation
 import MapConductorCore
 import UIKit
 
-private let markerClusterDefaultClusterRadiusPx: Double = 90.0
-private let markerClusterDefaultMinClusterSize: Int = 3
-private let markerClusterDefaultExpandMargin: Double = 0.2
-private let markerClusterDefaultTileSize: Double = 256.0
-private let markerClusterDefaultZoomAnimationDurationMillis: Int = 300
-public let markerClusterCameraDebounceMillis: Int = 100
-private let markerClusterMaxDenseCells: Int = 4
-private let markerClusterMaxDenseCandidates: Int = 50
-private let markerClusterPanAnimationMinDistanceMeters: Double = 1.0
-private let markerClusterCameraAngleEpsilon: Double = 1e-2
-private let markerClusterMinZoomDeltaForRender: Double = 0.02
-private let markerClusterDegToRad: Double = Double.pi / 180.0
-private let markerClusterMaxSinLat: Double = 0.9999
-private let markerClusterDefaultSpiderfyMarkerSizePx: Double = 52.0
-private let markerClusterDefaultSpiderfyMarkerMarginPx: Double = 8.0
-private let markerClusterDefaultSpiderfyLegWidth: Double = 1.5
-// '#666666' in the React SDK.
-private let markerClusterDefaultSpiderfyLegColor = UIColor(red: 0.4, green: 0.4, blue: 0.4, alpha: 1.0)
-
-/// ID prefix of the temporary markers rendered while a spiderfy fan is open.
-let spiderfyMarkerIdPrefix = "spider_"
-/// ID prefix of the leg polylines connecting the cluster center to fanned-out markers.
-let spiderfyLegIdPrefix = "spiderleg_"
-
-/// A screen-pixel offset relative to the spiderfied cluster's center.
-struct SpiderfyOffset {
-    var x: Double
-    var y: Double
-}
-
-/// Screen-space fan-out layout for spiderfy. Members start on an even circle
-/// around the cluster and then iteratively repel each other (and the cluster
-/// marker itself) until no pair is closer than markerSize + margin, while a
-/// weak spring toward the center keeps the fan compact. Converges to a ring
-/// for small counts and to packed shells for larger ones.
-func spiderfyLayout(
-    count: Int,
-    markerSizePx: Double,
-    marginPx: Double,
-    obstacles: [SpiderfyOffset] = []
-) -> [SpiderfyOffset] {
-    let desired = markerSizePx + marginPx
-    // クラスタ中心からの基本距離。脚線が見え、かつ離れすぎない程度
-    let centerClearance = (markerSizePx * 1.3).rounded() + marginPx
-    var points: [SpiderfyOffset] = (0..<count).map { i in
-        // 右方向(0°)基準で均等配置。2件なら左右に並び、ピン形クラスタの頭上を避けやすい
-        let angle = 2.0 * Double.pi * Double(i) / Double(count)
-        return SpiderfyOffset(x: cos(angle) * centerClearance, y: sin(angle) * centerClearance)
-    }
-    for _ in 0..<150 {
-        var maxMove = 0.0
-        for i in 0..<count {
-            var fx = 0.0
-            var fy = 0.0
-            // 展開メンバー同士の反発
-            for j in 0..<count where j != i {
-                let dx = points[i].x - points[j].x
-                let dy = points[i].y - points[j].y
-                var d = hypot(dx, dy)
-                if d == 0 { d = 0.01 }
-                if d < desired {
-                    let push = (desired - d) / 2.0
-                    fx += (dx / d) * push
-                    fy += (dy / d) * push
-                }
-            }
-            // 周囲に既に表示されているマーカー等(固定障害物)からの反発
-            for ob in obstacles {
-                let dx = points[i].x - ob.x
-                let dy = points[i].y - ob.y
-                var d = hypot(dx, dy)
-                if d == 0 { d = 0.01 }
-                if d < desired {
-                    let push = desired - d
-                    fx += (dx / d) * push
-                    fy += (dy / d) * push
-                }
-            }
-            var dc = hypot(points[i].x, points[i].y)
-            if dc == 0 { dc = 0.01 }
-            if dc < centerClearance {
-                // クラスタマーカーからの反発
-                let push = centerClearance - dc
-                fx += (points[i].x / dc) * push
-                fy += (points[i].y / dc) * push
-            } else {
-                // 中心へ弱いばね(離れすぎ防止)
-                let pull = (dc - centerClearance) * 0.15
-                fx -= (points[i].x / dc) * pull
-                fy -= (points[i].y / dc) * pull
-            }
-            points[i].x += fx * 0.6
-            points[i].y += fy * 0.6
-            maxMove = max(maxMove, abs(fx), abs(fy))
-        }
-        if maxMove < 0.15 { break }
-    }
-    return points
-}
-
-private enum MarkerClusterStrategyInstanceId {
-    private static let lock = NSLock()
-    private static var next: Int = 0
-
-    static func allocate() -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        next += 1
-        return next
-    }
-}
-
-/// Non-generic defaults shared by ``MarkerClusterStrategy`` and ``MarkerClusterGroupState``.
-public enum MarkerClusterDefaults {
-    public static let clusterRadiusPx: Double = markerClusterDefaultClusterRadiusPx
-    public static let minClusterSize: Int = markerClusterDefaultMinClusterSize
-    public static let expandMargin: Double = markerClusterDefaultExpandMargin
-    public static let tileSize: Double = markerClusterDefaultTileSize
-    public static let zoomAnimationDurationMillis: Int = markerClusterDefaultZoomAnimationDurationMillis
-    public static let cameraIdleDebounceMillis: Int = markerClusterCameraDebounceMillis
-    public static let spiderfyMarkerSizePx: Double = markerClusterDefaultSpiderfyMarkerSizePx
-    public static let spiderfyMarkerMarginPx: Double = markerClusterDefaultSpiderfyMarkerMarginPx
-    public static let spiderfyLegColor: UIColor = markerClusterDefaultSpiderfyLegColor
-    public static let spiderfyLegWidth: Double = markerClusterDefaultSpiderfyLegWidth
-    public static let iconProvider: (Int) -> MarkerIconProtocol = { count in
-        DefaultMarkerIcon(label: String(count))
-    }
-}
-
-/// ActualMarker に依存しない ``MarkerClusterStrategy`` の操作面。
-/// ``MarkerClusterGroupState`` がジェネリクスなしで戦略を管理するために使う。
-protocol MarkerClusterStrategyBase: AnyObject {
-    var onBeforeAnimation: (([MarkerClusterDebugInfo]) async -> Void)? { get set }
-    var debugInfoFlow: CurrentValueSubject<[MarkerClusterDebugInfo], Never> { get }
-    var spiderfyLegsFlow: CurrentValueSubject<[PolylineState], Never> { get }
-    func clear()
-    @MainActor func forceRender()
-}
-
-extension MarkerClusterStrategy: MarkerClusterStrategyBase {}
-
+/// 近くのマーカーを 1 つにまとめて描くマーカーレンダリングストラテジ。
+///
+/// このファイルが持つのは**元データの保持と生成・破棄**だけで、実際の仕事は
+/// 責務ごとに分けたファイルにある:
+///
+/// | ファイル                              | 担当                                       |
+/// |---------------------------------------|--------------------------------------------|
+/// | `MarkerClusterStrategy+Scheduling`    | いつ再クラスタするか（デバウンス・キュー） |
+/// | `MarkerClusterStrategy+Clustering`    | 何をどこにまとめるか（前回結果の再利用）   |
+/// | `MarkerClusterStrategy+Rendering`     | 計画と現状の差を描画へ反映                 |
+/// | `MarkerClusterStrategy+Animation`     | クラスタとメンバーの間の移動アニメーション |
+/// | `MarkerClusterStrategy+Spiderfy`      | クリックでメンバーを扇状に開く             |
+/// | ``ClusterBuilder``                    | 近い候補の併合と中心の選び方               |
+/// | ``ClusterGeometry``                   | 投影・境界・平均・凸包                     |
+/// | ``SpiderfyLayout``                    | 扇の画面上の配置計算                       |
+///
+/// **計算だけの部分は型として切り出し、状態に触る部分は extension にしてある。**
+/// Swift の Dictionary は値型なので、`renderedMarkerEntities` のような共有可変状態を
+/// 別の型へ渡すと写しになってしまう。参照型の入れ物を挟めば型に分けられるが、
+/// ロックと MainActor の絡む場所を作り替えることになるため、ここでは
+/// 同じインスタンスの extension に留めている
+/// （android-sdk はこの制約が無いので `ClusterMarkerRenderer` などの型に分けてある）。
+///
+/// extension から触るため、状態のプロパティはモジュール内公開になっている。
+/// このモジュールにはクラスタリング関連しか入っていないので、実質はこのファイル群専用。
 public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingStrategy<ActualMarker> {
     public static var DEFAULT_CLUSTER_RADIUS_PX: Double { markerClusterDefaultClusterRadiusPx }
     public static var DEFAULT_MIN_CLUSTER_SIZE: Int { markerClusterDefaultMinClusterSize }
@@ -156,19 +40,12 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
     public static var DEFAULT_SPIDERFY_LEG_COLOR: UIColor { markerClusterDefaultSpiderfyLegColor }
     public static var DEFAULT_SPIDERFY_LEG_WIDTH: Double { markerClusterDefaultSpiderfyLegWidth }
 
-    private static var cameraDebounceMillis: Int { markerClusterCameraDebounceMillis }
-    private static var maxDenseCells: Int { markerClusterMaxDenseCells }
-    private static var maxDenseCandidates: Int { markerClusterMaxDenseCandidates }
-    private static var panAnimationMinDistanceMeters: Double { markerClusterPanAnimationMinDistanceMeters }
-    private static var cameraAngleEpsilon: Double { markerClusterCameraAngleEpsilon }
-    private static var minZoomDeltaForRender: Double { markerClusterMinZoomDeltaForRender }
-    private static var degToRad: Double { markerClusterDegToRad }
-    private static var maxSinLat: Double { markerClusterMaxSinLat }
+    static var minZoomDeltaForRender: Double { markerClusterMinZoomDeltaForRender }
 
     public typealias ClusterIconProvider = (Int) -> MarkerIconProtocol
     public typealias ClusterIconProviderWithTurn = (Int, Int) -> MarkerIconProtocol
 
-	    private let instanceId: Int = MarkerClusterStrategyInstanceId.allocate()
+    let instanceId: Int = MarkerClusterStrategyInstanceId.allocate()
 
     public let clusterRadiusPx: Double
     public let minClusterSize: Int
@@ -214,47 +91,57 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
     /// updates before animations begin, so polygon rendering and marker animation cannot race.
     public var onBeforeAnimation: (([MarkerClusterDebugInfo]) async -> Void)?
 
-    private var sourceStates: [String: MarkerState] = [:]
-    private var sourceFingerprints: [String: MarkerFingerPrint] = [:]
-    private var lastCameraPosition: MapCameraPosition?
-    private var clusteringTurn: Int = 0
-    private var lastZoomKey: Int?
-    private var debounceTask: Task<Void, Never>?
-    private var cameraUpdateToken: Int64 = 0
-    private let tokenLock = NSLock()
-    private let renderQueueState = RenderQueueState()
-    private var renderTask: Task<Void, Never>?
-    private var lastViewport: GeoRectBounds?
-    private var lastKnownViewportZoom: Double?
-    private let rendererBox = MainQueueReleaseBox<AnyMarkerOverlayRenderer<ActualMarker>>()
+    // ── 計算だけを持つ部品（差し替え可能な唯一の継ぎ目） ────────────────────
+    let geometry: ClusterGeometry
+    let builder: ClusterBuilder
 
-    private let debugInfoSubject = CurrentValueSubject<[MarkerClusterDebugInfo], Never>([])
+    // ── 元データ ────────────────────────────────────────────────────────────
+    var sourceStates: [String: MarkerState] = [:]
+    var sourceFingerprints: [String: MarkerFingerPrint] = [:]
+    let sourceStatesLock = NSLock()
+    var sourceStateVersion: Int64 = 0
+
+    // ── カメラと再クラスタの段取り ──────────────────────────────────────────
+    var lastCameraPosition: MapCameraPosition?
+    var debounceTask: Task<Void, Never>?
+    var cameraUpdateToken: Int64 = 0
+    let tokenLock = NSLock()
+    let renderQueueState = RenderQueueState()
+    var renderTask: Task<Void, Never>?
+    var lastViewport: GeoRectBounds?
+    var lastKnownViewportZoom: Double?
+    let rendererBox = MainQueueReleaseBox<AnyMarkerOverlayRenderer<ActualMarker>>()
+
+    // ── 前回の描画結果（次回の再利用のためだけに持つ） ──────────────────────
+    let renderStateLock = NSLock()
+    var clusteringTurn: Int = 0
+    var lastZoomKey: Int?
+    var lastClusterMemberCenters: [String: GeoPoint] = [:]
+    var lastClusterPositions: [String: GeoPoint] = [:]
+    var lastRenderCameraPosition: MapCameraPosition?
+    var renderedMarkerEntities: [String: MarkerEntity<ActualMarker>] = [:]
+    var lastExpandedBounds: GeoRectBounds?
+    var lastClusterCoverageBounds: GeoRectBounds?
+    var lastClusterAssignments: [String: String] = [:]  // markerID -> clusterID
+    var lastSourceStateVersion: Int64 = 0
+    var lastSourceFingerprints: [String: MarkerFingerPrint] = [:]
+    var forceNextRender: Bool = false
+
+    let debugInfoSubject = CurrentValueSubject<[MarkerClusterDebugInfo], Never>([])
     public var debugInfoFlow: CurrentValueSubject<[MarkerClusterDebugInfo], Never> { debugInfoSubject }
     /// Leg polylines of the currently open spiderfy fan (empty when collapsed).
     /// ``MarkerClusterGroupState`` republishes this so `MarkerClusterGroup` can
     /// render the legs declaratively, the same way debug circles are rendered.
-    private let spiderfyLegsSubject = CurrentValueSubject<[PolylineState], Never>([])
+    let spiderfyLegsSubject = CurrentValueSubject<[PolylineState], Never>([])
     public var spiderfyLegsFlow: CurrentValueSubject<[PolylineState], Never> { spiderfyLegsSubject }
+
     // Spiderfy runtime state. Only touched from @MainActor methods
     // (trySpiderfy / applySpiderfy / collapseSpiderfy) and clear()'s MainActor task.
-    private var spiderfyClusterKey: String?
-    private var spiderfyEntities: [MarkerEntity<ActualMarker>] = []
+    var spiderfyClusterKey: String?
+    var spiderfyEntities: [MarkerEntity<ActualMarker>] = []
     // Monotonic token: collapsing (or a newer open) invalidates an apply that is
     // still waiting on prepareExpand, so a stale fan is never rendered.
-    private var spiderfyToken: Int = 0
-    private var lastClusterMemberCenters: [String: GeoPoint] = [:]
-    private var lastClusterPositions: [String: GeoPoint] = [:]
-    private var lastRenderCameraPosition: MapCameraPosition?
-    private var renderedMarkerEntities: [String: MarkerEntity<ActualMarker>] = [:]
-    private var lastExpandedBounds: GeoRectBounds?
-    private var lastClusterCoverageBounds: GeoRectBounds?
-    private var lastClusterAssignments: [String: String] = [:]  // markerID -> clusterID
-    private var lastSourceStateVersion: Int64 = 0
-    private var lastSourceFingerprints: [String: MarkerFingerPrint] = [:]
-    private let sourceStatesLock = NSLock()
-    private let renderStateLock = NSLock()
-    private var sourceStateVersion: Int64 = 0
-    private var forceNextRender: Bool = false
+    var spiderfyToken: Int = 0
 
     public init(
         clusterRadiusPx: Double = DEFAULT_CLUSTER_RADIUS_PX,
@@ -298,6 +185,9 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         self.spiderfyLegWidth = spiderfyLegWidth
         self.onSpiderfyChange = onSpiderfyChange
         self.prepareExpand = prepareExpand
+        let geometry = ClusterGeometry(tileSize: tileSize)
+        self.geometry = geometry
+        self.builder = ClusterBuilder(geometry: geometry, clusterRadiusPx: clusterRadiusPx)
         // Android: `MarkerManager(geocell, 0)` — minMarkerCount 0 keeps the hex spatial
         // index enabled from the first marker rather than only above MarkerManager's
         // 2000 default, so cluster hit-testing behaves the same on both platforms.
@@ -384,1096 +274,39 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         sourceStatesLock.unlock()
     }
 
-	    public override func onAdd<Renderer: MarkerOverlayRendererProtocol>(
-	        data: [MarkerState],
-	        viewport: GeoRectBounds,
-	        renderer: Renderer
-	    ) async -> Bool where Renderer.ActualMarker == ActualMarker {
-        MCLog.marker("MarkerClusterStrategy[\(instanceId)].onAdd count=\(data.count)")
-        lastViewport = viewport
-	        updateSourceStates(data)
-	        await MainActor.run { [weak self] in
-	            guard let self else { return }
-	            self.rendererBox.set(AnyMarkerOverlayRenderer(renderer))
-	        }
-        // A strategy can be attached after the native map is already loaded (the RN
-        // extension path does this). In that case marker ingestion and the initial camera
-        // callback are scheduled independently. Keep the source markers even when the
-        // camera has not arrived yet; onCameraChanged will render them once it does.
-        guard let cameraPosition = lastCameraPosition else { return true }
-	        await MainActor.run { [weak self] in
-	            guard let self else { return }
-	            self.enqueueRender(cameraPosition: cameraPosition, viewport: viewport, token: self.currentToken())
-	        }
-	        return true
-	    }
+    // ── 基底クラスの入口 ────────────────────────────────────────────────────
+    // Swift は extension で override できないため、宣言だけここに置き、中身は
+    // `MarkerClusterStrategy+Scheduling` に委譲している。
 
-	    public override func onUpdate<Renderer: MarkerOverlayRendererProtocol>(
-	        state: MarkerState,
-	        viewport: GeoRectBounds,
-	        renderer: Renderer
-	    ) async -> Bool where Renderer.ActualMarker == ActualMarker {
-        guard let cameraPosition = lastCameraPosition else { return true }
-        MCLog.marker("MarkerClusterStrategy[\(instanceId)].onUpdate id=\(state.id)")
-        sourceStatesLock.lock()
-        let nextFingerprint = state.fingerPrint()
-        let prevFingerprint = sourceFingerprints[state.id]
-        sourceStates[state.id] = state
-        sourceFingerprints[state.id] = nextFingerprint
-        if prevFingerprint != nextFingerprint {
-            sourceStateVersion &+= 1
-        }
-        sourceStatesLock.unlock()
-	        lastViewport = viewport
-	        await MainActor.run { [weak self] in
-	            guard let self else { return }
-	            self.rendererBox.set(AnyMarkerOverlayRenderer(renderer))
-	            self.enqueueRender(cameraPosition: cameraPosition, viewport: viewport, token: self.currentToken())
-	        }
-	        return true
-	    }
-
-	    public override func onCameraChanged<Renderer: MarkerOverlayRendererProtocol>(
-	        mapCameraPosition: MapCameraPosition,
-	        renderer: Renderer
-	    ) async where Renderer.ActualMarker == ActualMarker {
-        lastCameraPosition = mapCameraPosition
-        if let bounds = mapCameraPosition.visibleRegion?.bounds {
-            lastViewport = bounds
-            lastKnownViewportZoom = mapCameraPosition.zoom
-        }
-	        MCLog.marker("MarkerClusterStrategy[\(instanceId)].onCameraChanged zoom=\(mapCameraPosition.zoom)")
-	        await MainActor.run { [weak self] in
-	            guard let self else { return }
-	            self.rendererBox.set(AnyMarkerOverlayRenderer(renderer))
-	        }
-	        let token = incrementToken()
-	        debounceTask?.cancel()
-	        debounceTask = Task { [weak self] in
-            guard let self else { return }
-            let nanos = UInt64(cameraIdleDebounceMillis) * 1_000_000
-            try? await Task.sleep(nanoseconds: nanos)
-            guard !Task.isCancelled else { return }
-            guard token == self.currentToken() else { return }
-            let viewport =
-                mapCameraPosition.visibleRegion?.bounds ??
-                self.estimateViewport(zoom: mapCameraPosition.zoom, center: mapCameraPosition.position) ??
-                self.lastViewport
-            guard let viewport else {
-                MCLog.marker("MarkerClusterStrategy[\(self.instanceId)].onCameraChanged viewportMissing")
-                return
-            }
-            self.lastViewport = viewport
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.enqueueRender(cameraPosition: mapCameraPosition, viewport: viewport, token: token)
-            }
-        }
-    }
-
-	    @MainActor
-	    private func enqueueRender(
-	        cameraPosition: MapCameraPosition,
-	        viewport: GeoRectBounds,
-	        token: Int64
-	    ) {
-	        guard rendererBox.get() != nil else {
-	            MCLog.marker("MarkerClusterStrategy[\(instanceId)].enqueueRender skipped: rendererMissing token=\(token)")
-	            return
-	        }
-	        let request = RenderRequest(cameraPosition: cameraPosition, viewport: viewport, token: token)
-	        Task { [renderQueueState] in await renderQueueState.enqueue(request) }
-	        MCLog.marker("MarkerClusterStrategy[\(instanceId)].enqueueRender token=\(token)")
-	        if renderTask == nil {
-	            renderTask = Task { [weak self] in
-	                guard let self else { return }
-                await self.processRenderQueue()
-            }
-        }
-    }
-
-    private func processRenderQueue() async {
-        while true {
-            if Task.isCancelled {
-                await MainActor.run { [weak self] in
-                    self?.renderTask = nil
-                }
-                return
-            }
-            let request = await renderQueueState.take()
-            guard let request else {
-                await MainActor.run { [weak self] in
-                    self?.renderTask = nil
-                }
-                return
-            }
-
-            MCLog.marker("MarkerClusterStrategy[\(instanceId)].processRenderQueue token=\(request.token)")
-            await self.renderClusters(cameraPosition: request.cameraPosition, viewport: request.viewport, token: request.token)
-        }
-    }
-
-    private func updateSourceStates(_ data: [MarkerState]) {
-        sourceStatesLock.lock()
-        defer { sourceStatesLock.unlock() }
-        let nextIds = Set(data.map { $0.id })
-        let removedIds = Set(sourceStates.keys).subtracting(nextIds)
-        var changed = false
-        removedIds.forEach {
-            sourceStates.removeValue(forKey: $0)
-            sourceFingerprints.removeValue(forKey: $0)
-            changed = true
-        }
-        data.forEach { state in
-            let nextFingerprint = state.fingerPrint()
-            let prevFingerprint = sourceFingerprints[state.id]
-            if prevFingerprint != nextFingerprint {
-                changed = true
-            }
-            sourceStates[state.id] = state
-            sourceFingerprints[state.id] = nextFingerprint
-        }
-        if changed {
-            sourceStateVersion &+= 1
-        }
-    }
-
-    private func renderClusters(
-        cameraPosition: MapCameraPosition,
+    public override func onAdd<Renderer: MarkerOverlayRendererProtocol>(
+        data: [MarkerState],
         viewport: GeoRectBounds,
-        token: Int64
-    ) async {
-        // Check before entering semaphore to avoid blocking
-        if Task.isCancelled { return }
-        if token != currentToken() { return }
-
-	        await semaphore.withPermit {
-	            // Double-check cancellation and renderer validity after acquiring semaphore
-	            if Task.isCancelled { return }
-	            if token != currentToken() { return }
-	            guard rendererBox.get() != nil else {
-	                MCLog.marker("MarkerClusterStrategy[\(instanceId)].renderClusters aborted: rendererMissing")
-	                return
-	            }
-	            let expandedBounds = expandBounds(bounds: viewport, margin: expandMargin)
-	            let zoom = cameraPosition.zoom
-	            let effectiveRadiusPx = effectiveClusterRadiusPx(zoom: zoom)
-	            let zoomChange = updateClusteringTurn(zoom: zoom)
-	            let turn = zoomChange.turn
-            let zoomChanged = zoomChange.zoomChanged
-            renderStateLock.lock()
-            let forced = forceNextRender
-            forceNextRender = false
-            let lastRenderCameraPositionSnapshot = lastRenderCameraPosition
-            let lastClusterCoverageBoundsSnapshot = lastClusterCoverageBounds
-            let lastClusterAssignmentsSnapshot = lastClusterAssignments
-            let lastClusterPositionsSnapshot = lastClusterPositions
-            let lastClusterMemberCentersSnapshot = lastClusterMemberCenters
-            let lastSourceStateVersionSnapshot = lastSourceStateVersion
-            let lastSourceFingerprintsSnapshot = lastSourceFingerprints
-            renderStateLock.unlock()
-            let sourceStateVersionSnapshot: Int64 = {
-                sourceStatesLock.lock()
-                defer { sourceStatesLock.unlock() }
-                return sourceStateVersion
-            }()
-            let cameraMoved = lastRenderCameraPositionSnapshot.map { hasCameraMoved(previous: $0, current: cameraPosition) } ?? false
-            let animateTransitions =
-                (enableZoomAnimation && zoomChanged) ||
-                (enablePanAnimation && cameraMoved)
-	        MCLog.marker("MarkerClusterStrategy[\(instanceId)].renderClusters token=\(token) zoom=\(zoom) animate=\(animateTransitions)")
-
-            // Any effective recluster input change (zoom change / camera pan /
-            // source data change / forced) collapses an open spiderfy fan,
-            // matching the React SDK where every recluster collapses it. A
-            // content re-attachment with unchanged inputs (e.g. the SwiftUI
-            // re-render triggered by opening the fan itself) must not collapse.
-            if forced || zoomChanged || cameraMoved
-                || sourceStateVersionSnapshot != lastSourceStateVersionSnapshot {
-                await collapseSpiderfy()
-            }
-
-            if zoomChanged,
-               let lastRendered = lastRenderCameraPositionSnapshot,
-               abs(zoom - lastRendered.zoom) < MarkerClusterStrategy.minZoomDeltaForRender {
-	                MCLog.marker("MarkerClusterStrategy[\(instanceId)].renderClusters earlyReturn token=\(token) reason=zoomDeltaTooSmall")
-                return
-            }
-
-            // Early return optimization: if panning and previous coverage contains current viewport (and markers didn't change), no need to recalculate
-            if !forced,
-               !zoomChanged,
-               let lastClusterCoverageBoundsSnapshot,
-               containsBounds(container: lastClusterCoverageBoundsSnapshot, target: expandedBounds),
-               sourceStateVersionSnapshot == lastSourceStateVersionSnapshot {
-	                MCLog.marker("MarkerClusterStrategy[\(instanceId)].renderClusters earlyReturn token=\(token) reason=boundsContained")
-                renderStateLock.lock()
-                lastRenderCameraPosition = cameraPosition
-                renderStateLock.unlock()
-                return
-            }
-
-            await cleanupStaleMarkers(currentZoom: zoom, skipClusterRemoval: animateTransitions)
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
-
-            var debugInfos: [MarkerClusterDebugInfo] = []
-            var clusterMemberCenters: [String: GeoPoint] = [:]
-            var clusterPositions: [String: GeoPoint] = [:]
-
-            // Clear cluster assignments on zoom change to force full reclustering
-            if zoomChanged {
-                renderStateLock.lock()
-                lastClusterAssignments = [:]
-                renderStateLock.unlock()
-            }
-
-            // Partition markers: cached (already clustered) vs new (need clustering)
-            var cachedMarkers: [MarkerState] = []
-            var newMarkers: [MarkerState] = []
-
-            // Antimeridian-aware viewport containment check.
-            // GeoRectBounds.contains(point:) does not handle the case where the viewport crosses
-            // the date line (sw.longitude > ne.longitude). At very low zoom the heuristic is inverted
-            // to avoid excluding large portions of the globe.
-            func containsInViewport(_ bounds: GeoRectBounds?, point: GeoPoint) -> Bool {
-                guard let bounds, !bounds.isEmpty else { return false }
-                guard let sw = bounds.southWest, let ne = bounds.northEast else { return false }
-                func wrapLon(_ lon: Double) -> Double {
-                    let r = lon.truncatingRemainder(dividingBy: 360.0)
-                    return r > 180 ? r - 360 : r < -180 ? r + 360 : r
-                }
-                guard point.latitude >= sw.latitude && point.latitude <= ne.latitude else { return false }
-                let pLon = wrapLon(point.longitude)
-                let west = wrapLon(sw.longitude)
-                let east = wrapLon(ne.longitude)
-                if west <= east { return pLon >= west && pLon <= east }
-                // Antimeridian crossing (west > east).
-                if zoom <= 4.0 {
-                    // At very low zoom the visible region can span >180°; treat bounds as a large
-                    // span and accept the complement range so most markers remain visible.
-                    return pLon >= east && pLon <= west
-                }
-                return pLon >= west || pLon <= east
-            }
-
-            let sourceSnapshot: [MarkerState] = {
-                sourceStatesLock.lock()
-                defer { sourceStatesLock.unlock() }
-                return Array(sourceStates.values)
-            }()
-            for state in sourceSnapshot {
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
-                if !containsInViewport(expandedBounds, point: state.position) { continue }
-
-                let currentFingerprint = state.fingerPrint()
-                let lastFingerprint = lastSourceFingerprintsSnapshot[state.id]
-                let movedSinceLastRender =
-                    lastFingerprint != nil &&
-                    (lastFingerprint?.latitude != currentFingerprint.latitude ||
-                     lastFingerprint?.longitude != currentFingerprint.longitude)
-
-                if let lastCoverageBounds = lastClusterCoverageBoundsSnapshot,
-                   !zoomChanged,
-                   containsInViewport(lastCoverageBounds, point: state.position),
-                   lastClusterAssignmentsSnapshot[state.id] != nil,
-                   !movedSinceLastRender {
-                    cachedMarkers.append(state)
-                } else {
-                    newMarkers.append(state)
-                }
-            }
-
-	            MCLog.marker("MarkerClusterStrategy[\(instanceId)].partition token=\(token) cached=\(cachedMarkers.count) new=\(newMarkers.count)")
-
-            // Rebuild cached cluster groups from assignments
-            var cachedClusterGroups: [String: [MarkerState]] = [:]
-            var cachedMarkerGroups: [String: [MarkerState]] = [:]
-            for marker in cachedMarkers {
-                if let clusterId = lastClusterAssignmentsSnapshot[marker.id] {
-                    if clusterId.hasPrefix("cluster_") {
-                        cachedClusterGroups[clusterId, default: []].append(marker)
-                    } else {
-                        cachedMarkerGroups[clusterId, default: []].append(marker)
-                    }
-                } else {
-                    cachedMarkerGroups[marker.id, default: []].append(marker)
-                }
-            }
-
-            // Early return check before heavy processing
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
-
-            // Apply standard clustering only to new markers
-            var newClustered: [ClusterCell: [MarkerState]] = [:]
-            for state in newMarkers {
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
-                let (x, y) = projectToPixel(position: state.position, zoom: zoom, tileSize: tileSize)
-                let cell = ClusterCell(
-                    x: Int(floor(x / effectiveRadiusPx)),
-                    y: Int(floor(y / effectiveRadiusPx))
-                )
-                newClustered[cell, default: []].append(state)
-            }
-
-            let newCandidates = newClustered.keys.sorted { lhs, rhs in
-                if lhs.x == rhs.x { return lhs.y < rhs.y }
-                return lhs.x < rhs.x
-            }.compactMap { cell -> ClusterCandidate? in
-                guard let members = newClustered[cell], let center = members.first?.position else { return nil }
-                return ClusterCandidate(
-                    cell: cell,
-                    center: GeoPoint.from(position: center),
-                    members: members
-                )
-            }
-
-            // Early return check before heavy processing
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
-
-            let newMergedClusters = mergeClusters(candidates: newCandidates, zoom: zoom, effectiveRadiusPx: effectiveRadiusPx)
-
-            // Early return check after heavy processing
-            if Task.isCancelled { return }
-            if token != currentToken() { return }
-
-            // Merge new clusters with nearby cached clusters
-            var finalMergedClusters: [MergedCluster] = []
-            var usedCachedClusters: Set<String> = []
-
-            for newCluster in newMergedClusters {
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
-
-                var mergedWithCached = false
-                let newCenter = newCluster.center
-
-                // Check proximity to cached cluster positions
-                for (cachedClusterId, cachedMembers) in cachedClusterGroups {
-                    guard !usedCachedClusters.contains(cachedClusterId) else { continue }
-                    guard let cachedPosition = lastClusterPositionsSnapshot[cachedClusterId] else { continue }
-
-                    let metersPerPixelVal = metersPerPixel(position: newCenter, zoom: zoom, tileSize: tileSize)
-                    let thresholdMeters = effectiveRadiusPx * metersPerPixelVal
-                    let distance = Spherical.computeDistanceBetween(newCenter, cachedPosition)
-
-                    if distance <= thresholdMeters {
-                        // Merge new markers into cached cluster
-                        let combinedMembers = cachedMembers + newCluster.members
-                        finalMergedClusters.append(
-                            MergedCluster(center: cachedPosition, members: combinedMembers)
-                        )
-                        usedCachedClusters.insert(cachedClusterId)
-                        mergedWithCached = true
-                        break
-                    }
-                }
-
-                if !mergedWithCached {
-                    // New cluster stands alone
-                    finalMergedClusters.append(newCluster)
-                }
-            }
-
-            // Add unmerged cached clusters
-            for (cachedClusterId, cachedMembers) in cachedClusterGroups {
-                guard !usedCachedClusters.contains(cachedClusterId) else { continue }
-                if let cachedPosition = lastClusterPositionsSnapshot[cachedClusterId] {
-                    finalMergedClusters.append(
-                        MergedCluster(center: cachedPosition, members: cachedMembers)
-                    )
-                }
-            }
-
-            // Track which marker IDs have already been used in clusters to prevent duplicates
-            var usedMarkerIds = Set<String>()
-            for merged in finalMergedClusters {
-                for member in merged.members {
-                    usedMarkerIds.insert(member.id)
-                }
-            }
-
-            // Keep cached single markers ONLY if not already used in a cluster
-            for (_, cachedMembers) in cachedMarkerGroups {
-                let unusedMembers = cachedMembers.filter { !usedMarkerIds.contains($0.id) }
-                guard !unusedMembers.isEmpty else { continue }
-                guard let center = unusedMembers.first?.position else { continue }
-                finalMergedClusters.append(
-                    MergedCluster(center: GeoPoint.from(position: center), members: unusedMembers)
-                )
-                // Track these newly added markers
-                for member in unusedMembers {
-                    usedMarkerIds.insert(member.id)
-                }
-            }
-
-            let mergedClusters = finalMergedClusters
-            var desiredStates: [MarkerState] = []
-            let coverageBounds = GeoRectBounds()
-            var nextClusterAssignments: [String: String] = [:]
-
-            // Debug: verify no duplicate markers in mergedClusters
-            #if DEBUG
-            var allMemberIds = Set<String>()
-            var duplicateMemberIds = Set<String>()
-            for merged in mergedClusters {
-                for member in merged.members {
-                    if allMemberIds.contains(member.id) {
-                        duplicateMemberIds.insert(member.id)
-                    }
-                    allMemberIds.insert(member.id)
-                }
-            }
-            if !duplicateMemberIds.isEmpty {
-	                MCLog.marker("MarkerClusterStrategy[\(instanceId)].WARNING token=\(token) duplicateMembersInMergedClusters=\(duplicateMemberIds)")
-            }
-            #endif
-
-            for merged in mergedClusters {
-                if Task.isCancelled { return }
-                if token != currentToken() { return }
-                if merged.members.count >= minClusterSize {
-                    // Compute hull once; reuse for both centroid and debug visualization.
-                    // Degenerate hulls (all members at nearly the same point) fall back
-                    // to the member average, so a same-venue cluster is rendered exactly
-                    // at that venue rather than at the first member / a cached position.
-                    let hull = convexHullProjected(members: merged.members, zoom: zoom)
-                    let centroidPoint = polygonCentroidProjected(hull)
-                    let center: GeoPoint = centroidPoint
-                        .map { unprojectFromPixel(x: $0.x, y: $0.y, zoom: zoom) }
-                        ?? averageGeoPoints(points: merged.members.map { GeoPoint.from(position: $0.position) })
-
-                    // The rendered center is recomputed from the CURRENT members on
-                    // every recluster (camera idle). Membership-stable pans therefore
-                    // yield the identical centroid — no flicker — while membership
-                    // changes move the cluster to its true center instead of freezing
-                    // it at a stale cached position.
-                    let (cx, cy) = projectToPixel(position: center, zoom: zoom, tileSize: tileSize)
-                    let cell = ClusterCell(
-                        x: Int(floor(cx / effectiveRadiusPx)),
-                        y: Int(floor(cy / effectiveRadiusPx))
-                    )
-                    let clusterId = buildClusterId(cell: cell, zoom: zoom)
-
-                    let radiusMeters = calculateClusterRadiusMeters(center: center, members: merged.members)
-                    let cluster = MarkerCluster(
-                        count: merged.members.count,
-                        markerIds: merged.members.map { $0.id }
-                    )
-                    let hullGeoPoints: [GeoPoint] = hull.count >= 3
-                        ? hull.map { unprojectFromPixel(x: $0.x, y: $0.y, zoom: zoom) }
-                        : []
-                    debugInfos.append(
-                        MarkerClusterDebugInfo(
-                            id: clusterId,
-                            center: center,
-                            radiusMeters: radiusMeters,
-                            count: merged.members.count,
-                            hullPoints: hullGeoPoints
-                        )
-                    )
-                    extendCoverageBounds(bounds: coverageBounds, center: center, radiusMeters: radiusMeters)
-                    for member in merged.members {
-                        clusterMemberCenters[member.id] = center
-                        nextClusterAssignments[member.id] = clusterId
-                    }
-                    clusterPositions[clusterId] = center
-                    let icon =
-                        clusterIconProviderWithTurn?(merged.members.count, turn) ??
-                        clusterIconProvider(merged.members.count)
-                    // Cluster clicks first try spiderfy (when configured & zoomed in
-                    // enough), then fall through to the app's onClusterClick.
-                    let clusterClickable = onClusterClick != nil || spiderfyMinZoom != nil
-                    let clusterState = MarkerState(
-                        position: center,
-                        id: clusterId,
-                        extra: cluster,
-                        icon: icon,
-                        animation: nil,
-                        clickable: clusterClickable,
-                        draggable: false,
-                        onClick: clusterClickable ? { [weak self] _ in
-                            guard let self else { return }
-                            self.handleClusterClick(cluster)
-                        } : nil,
-                        onDragStart: nil,
-                        onDrag: nil,
-                        onDragEnd: nil,
-                        onAnimateStart: nil,
-                        onAnimateEnd: nil
-                    )
-                    desiredStates.append(clusterState)
-                } else {
-                    merged.members.forEach { member in
-                        coverageBounds.extend(point: member.position)
-                        nextClusterAssignments[member.id] = member.id
-                    }
-                    desiredStates.append(contentsOf: merged.members)
-                }
-            }
-
-            if token != currentToken() { return }
-
-            // Debug: verify no duplicate IDs in desiredStates
-            #if DEBUG
-            let uniqueDesiredIds = Set(desiredStates.map { $0.id })
-            if uniqueDesiredIds.count != desiredStates.count {
-	                MCLog.marker("MarkerClusterStrategy[\(instanceId)].ERROR token=\(token) duplicateIdsInDesiredStates count=\(desiredStates.count) unique=\(uniqueDesiredIds.count)")
-                var seenIds = Set<String>()
-                var duplicates = Set<String>()
-                for state in desiredStates {
-                    if seenIds.contains(state.id) {
-                        duplicates.insert(state.id)
-                    }
-                    seenIds.insert(state.id)
-                }
-	                MCLog.marker("MarkerClusterStrategy[\(instanceId)].duplicateIds token=\(token) ids=\(duplicates)")
-            }
-            #endif
-
-	            await applyRender(
-		                desiredStates: desiredStates,
-		                token: token,
-		                animateTransitions: animateTransitions,
-	                debugInfos: debugInfos,
-	                previousClusterMemberCenters: lastClusterMemberCentersSnapshot,
-	                nextClusterMemberCenters: clusterMemberCenters,
-	                previousClusterPositions: lastClusterPositionsSnapshot,
-	                nextClusterPositions: clusterPositions
-	            )
-	            renderStateLock.lock()
-	            lastClusterMemberCenters = clusterMemberCenters
-	            lastClusterPositions = clusterPositions
-	            lastClusterAssignments = nextClusterAssignments
-            lastRenderCameraPosition = cameraPosition
-            lastExpandedBounds = expandedBounds
-            lastClusterCoverageBounds = coverageBounds.isEmpty ? nil : coverageBounds
-            lastSourceStateVersion = sourceStateVersionSnapshot
-            // Keep fingerprints for marker move invalidation.
-            // (Only update the entries we saw this render to avoid scanning all markers again.)
-            for state in sourceSnapshot {
-                lastSourceFingerprints[state.id] = state.fingerPrint()
-            }
-            let renderedCount = renderedMarkerEntities.count
-            renderStateLock.unlock()
-	            MCLog.marker(
-	                "MarkerClusterStrategy[\(instanceId)].renderClusters stats token=\(token) source=\(sourceStates.count) rendered=\(renderedCount) manager=\(markerManager.allEntities().count)"
-	            )
-	        }
-	    }
-
-	    @MainActor
-	    private func applyRender(
-	        desiredStates: [MarkerState],
-	        token: Int64,
-	        animateTransitions: Bool,
-	        debugInfos: [MarkerClusterDebugInfo],
-	        previousClusterMemberCenters: [String: GeoPoint],
-	        nextClusterMemberCenters: [String: GeoPoint],
-	        previousClusterPositions: [String: GeoPoint],
-	        nextClusterPositions: [String: GeoPoint]
-	    ) async {
-	        guard let renderer = rendererBox.get() else {
-	            MCLog.marker("MarkerClusterStrategy[\(instanceId)].applyRender skipped: rendererMissing token=\(token)")
-	            return
-	        }
-	        debugInfoSubject.value = debugInfos
-	        // Commit hull polygon updates before animation starts so polygon rendering
-	        // and marker animation cannot race each other.
-	        await onBeforeAnimation?(debugInfos)
-	        // Keep the current (clustered) rendering on screen until the app finishes
-	        // preparing the newly appearing individual markers (e.g. icon preloading).
-	        // A newer camera update increments the token while we wait, superseding
-	        // this apply so a stale cluster state is never rendered.
-	        if let prepareExpand {
-	            let appearing = desiredStates.filter { state in
-	                !state.id.hasPrefix("cluster_") && markerManager.getEntity(state.id) == nil
-	            }
-	            if !appearing.isEmpty {
-	                await prepareExpand(appearing)
-	                if Task.isCancelled { return }
-	                if token != currentToken() { return }
-	            }
-	        }
-	        await updateRenderedMarkers(
-	            desiredStates: desiredStates,
-	            renderer: renderer,
-	            token: token,
-	            animateTransitions: animateTransitions,
-	            previousClusterMemberCenters: previousClusterMemberCenters,
-	            nextClusterMemberCenters: nextClusterMemberCenters,
-	            previousClusterPositions: previousClusterPositions,
-	            nextClusterPositions: nextClusterPositions
-	        )
-	    }
-
-	    @MainActor
-	    private func updateRenderedMarkers(
-	        desiredStates: [MarkerState],
-	        renderer: AnyMarkerOverlayRenderer<ActualMarker>,
-	        token: Int64,
-	        animateTransitions: Bool,
-	        previousClusterMemberCenters: [String: GeoPoint],
-	        nextClusterMemberCenters: [String: GeoPoint],
-	        previousClusterPositions: [String: GeoPoint],
-	        nextClusterPositions: [String: GeoPoint]
-	    ) async {
-	        // If polygon synchronization allowed a newer camera update to arrive,
-	        // reconcile this result without animation instead of returning and leaving
-	        // the previously rendered markers on the provider map.
-	        if Task.isCancelled { return }
-	        let animationIsCurrent = token == currentToken()
-
-        var desiredById: [String: MarkerState] = [:]
-        for state in desiredStates {
-            desiredById[state.id] = state
-        }
-        let animateZoom = animateTransitions && zoomAnimationDurationMillis > 0 && animationIsCurrent
-        // Spiderfy markers are managed by trySpiderfy/collapseSpiderfy, never by
-        // the cluster diff — exclude them so a recluster does not remove them
-        // behind the fan's back (collapseSpiderfy owns their lifecycle).
-        let existing = markerManager.allEntities()
-            .filter { !$0.state.id.hasPrefix(spiderfyMarkerIdPrefix) }
-        var existingById: [String: MarkerEntity<ActualMarker>] = [:]
-        for entity in existing {
-            existingById[entity.state.id] = entity
-        }
-	        MCLog.marker("MarkerClusterStrategy[\(instanceId)].updateRenderedMarkers token=\(token) desired=\(desiredStates.count) existing=\(existing.count) animate=\(animateZoom)")
-
-        if !animateZoom {
-            let orphanedIds = Set(existingById.keys).subtracting(desiredById.keys)
-            renderStateLock.lock()
-            let orphanedEntitiesBeforeAnimation = orphanedIds.compactMap { renderedMarkerEntities[$0] }
-            renderStateLock.unlock()
-            if !orphanedEntitiesBeforeAnimation.isEmpty {
-                await renderer.onRemove(data: orphanedEntitiesBeforeAnimation)
-
-                renderStateLock.lock()
-                for entity in orphanedEntitiesBeforeAnimation {
-                    renderedMarkerEntities.removeValue(forKey: entity.state.id)
-                    _ = markerManager.removeEntity(entity.state.id)
-                }
-                renderStateLock.unlock()
-
-                await renderer.onPostProcess()
-            }
-        }
-
-        let existingAfterCleanup = markerManager.allEntities()
-            .filter { !$0.state.id.hasPrefix(spiderfyMarkerIdPrefix) }
-        var existingByIdAfterCleanup: [String: MarkerEntity<ActualMarker>] = [:]
-        for entity in existingAfterCleanup {
-            existingByIdAfterCleanup[entity.state.id] = entity
-        }
-
-        let removeIds = Set(existingByIdAfterCleanup.keys).subtracting(desiredById.keys)
-        let addStates = desiredById.filter { existingByIdAfterCleanup[$0.key] == nil }.map { $0.value }
-        let updateStates = desiredById.filter { existingByIdAfterCleanup[$0.key] != nil }.map { $0.value }
-
-        let animatedRemoveEntries: [AnimatedRemove] =
-            if animateZoom {
-                removeIds.compactMap { id in
-                    guard let entity = existingByIdAfterCleanup[id] else { return nil }
-                    let isCluster = id.hasPrefix("cluster_")
-                    let target: GeoPoint
-                    if isCluster {
-                        let cluster = entity.state.extra as? MarkerCluster
-                        let memberIds = cluster?.markerIds ?? []
-                        if memberIds.isEmpty { return nil }
-                        let memberTargets = memberIds.compactMap { nextClusterMemberCenters[$0] }
-                        if memberTargets.isEmpty { return nil }
-                        target = averageGeoPoints(points: memberTargets)
-                    } else {
-                        guard let nextTarget = nextClusterMemberCenters[id] else { return nil }
-                        target = nextTarget
-                    }
-                    return AnimatedRemove(entity: entity, target: target)
-                }
-            } else {
-                []
-            }
-        let animatedRemoveIds = Set(animatedRemoveEntries.map { $0.entity.state.id })
-
-        let animatedAddEntries: [AnimatedAdd] =
-            if animateZoom {
-                addStates.compactMap { state in
-                    let isCluster = state.id.hasPrefix("cluster_")
-                    let start: GeoPoint
-                    if isCluster {
-                        let cluster = state.extra as? MarkerCluster
-                        let memberIds = cluster?.markerIds ?? []
-                        if memberIds.isEmpty { return nil }
-                        let memberStarts = memberIds.compactMap { previousClusterMemberCenters[$0] }
-                        if memberStarts.isEmpty { return nil }
-                        start = averageGeoPoints(points: memberStarts)
-                    } else {
-                        guard let previous = previousClusterMemberCenters[state.id] else { return nil }
-                        start = previous
-                    }
-                    return AnimatedAdd(state: state, start: start)
-                }
-            } else {
-                []
-            }
-        let animatedAddIds = Set(animatedAddEntries.map { $0.state.id })
-
-        let immediateRemoveIds = removeIds.subtracting(animatedRemoveIds)
-        let immediateAddStates = addStates.filter { !animatedAddIds.contains($0.id) }
-
-        var didImmediateChange = false
-        if !immediateRemoveIds.isEmpty {
-            renderStateLock.lock()
-            let removedEntities = immediateRemoveIds.compactMap { renderedMarkerEntities[$0] }
-            renderStateLock.unlock()
-            if !removedEntities.isEmpty {
-                await renderer.onRemove(data: removedEntities)
-
-                renderStateLock.lock()
-                for entity in removedEntities {
-                    renderedMarkerEntities.removeValue(forKey: entity.state.id)
-                    _ = markerManager.removeEntity(entity.state.id)
-                }
-                renderStateLock.unlock()
-                didImmediateChange = true
-            }
-        }
-
-        if !immediateAddStates.isEmpty {
-            let addParams = immediateAddStates.map { state in
-                MarkerOverlayAddParams(
-                    state: state,
-                    bitmapIcon: state.icon?.toBitmapIcon() ?? defaultMarkerIcon
-                )
-            }
-            let actualMarkers = await renderer.onAdd(data: addParams)
-
-            for (index, actualMarker) in actualMarkers.enumerated() {
-                guard let actualMarker else { continue }
-                let entity = MarkerEntity(
-                    marker: actualMarker,
-                    state: addParams[index].state,
-                    visible: true,
-                    isRendered: true
-                )
-                markerManager.registerEntity(entity)
-                renderStateLock.lock()
-                renderedMarkerEntities[entity.state.id] = entity
-                renderStateLock.unlock()
-            }
-            didImmediateChange = true
-        }
-
-        var changeParams: [MarkerOverlayChangeParams<ActualMarker>] = []
-        var changeEntities: [MarkerEntity<ActualMarker>] = []
-
-        for state in updateStates {
-            guard let prev = existingByIdAfterCleanup[state.id] else { continue }
-            let nextEntity = MarkerEntity(
-                marker: prev.marker,
-                state: state,
-                visible: true,
-                isRendered: true
-            )
-            markerManager.registerEntity(nextEntity)
-
-            if prev.fingerPrint == state.fingerPrint() {
-                continue
-            }
-
-            let change = MarkerOverlayChangeParams(
-                current: nextEntity,
-                bitmapIcon: state.icon?.toBitmapIcon() ?? defaultMarkerIcon,
-                prev: prev
-            )
-            changeParams.append(change)
-            changeEntities.append(nextEntity)
-        }
-
-        if !changeParams.isEmpty {
-            let actualMarkers = await renderer.onChange(data: changeParams)
-
-            for (index, actualMarker) in actualMarkers.enumerated() {
-                guard let actualMarker else { continue }
-                let entity = MarkerEntity(
-                    marker: actualMarker,
-                    state: changeEntities[index].state,
-                    visible: true,
-                    isRendered: true
-                )
-                markerManager.registerEntity(entity)
-                renderStateLock.lock()
-                renderedMarkerEntities[entity.state.id] = entity
-                renderStateLock.unlock()
-            }
-            didImmediateChange = true
-        }
-
-        if didImmediateChange {
-            await renderer.onPostProcess()
-        }
-
-        if !animateZoom || (animatedRemoveEntries.isEmpty && animatedAddEntries.isEmpty) {
-            return
-        }
-
-        let animatedStartEntities: [MarkerEntity<ActualMarker>]
-        if !animatedAddEntries.isEmpty {
-            let animatedStartStates = animatedAddEntries.map { entry in
-                entry.state.copy(position: entry.start)
-            }
-            animatedStartEntities = await addStatesToRenderer(states: animatedStartStates, renderer: renderer)
-
-            await renderer.onPostProcess()
-        } else {
-            animatedStartEntities = []
-        }
-
-        var moves: [AnimatedMove] = []
-        for entry in animatedAddEntries {
-            guard let entity = markerManager.getEntity(entry.state.id) else { continue }
-            moves.append(
-                AnimatedMove(
-                    id: entry.state.id,
-                    start: entry.start,
-                    end: GeoPoint.from(position: entry.state.position),
-                    baseState: entry.state,
-                    entity: entity
-                )
-            )
-        }
-        for entry in animatedRemoveEntries {
-            moves.append(
-                AnimatedMove(
-                    id: entry.entity.state.id,
-                    start: GeoPoint.from(position: entry.entity.state.position),
-                    end: entry.target,
-                    baseState: entry.entity.state,
-                    entity: entry.entity
-                )
-            )
-        }
-
-        let completed = await animateMarkerMoves(
-            moves: moves,
-            renderer: renderer,
-            durationMillis: zoomAnimationDurationMillis,
-            token: token
-        )
-
-        // Match Android's cancellation semantics: even when a newer camera update
-        // invalidates this animation, the markers participating in this transition
-        // must be removed. Returning here leaves the outgoing cluster markers (and
-        // potentially the temporary incoming markers) on the map indefinitely.
-        if !animatedRemoveEntries.isEmpty {
-            let entitiesToRemove = animatedRemoveEntries
-                .map { $0.entity }
-                .filter { entity in
-                    renderStateLock.lock()
-                    let exists = renderedMarkerEntities[entity.state.id] != nil
-                    renderStateLock.unlock()
-                    return exists
-                }
-            if !entitiesToRemove.isEmpty {
-                await renderer.onRemove(data: entitiesToRemove)
-
-                renderStateLock.lock()
-                for entity in entitiesToRemove {
-                    renderedMarkerEntities.removeValue(forKey: entity.state.id)
-                    _ = markerManager.removeEntity(entity.state.id)
-                }
-                renderStateLock.unlock()
-
-                await renderer.onPostProcess()
-            }
-        }
-
-        if !completed, !animatedStartEntities.isEmpty {
-            let entitiesToRemoveOnCancel = animatedStartEntities
-                .filter { entity in
-                    renderStateLock.lock()
-                    let exists = renderedMarkerEntities[entity.state.id] != nil
-                    renderStateLock.unlock()
-                    return exists
-                }
-            if !entitiesToRemoveOnCancel.isEmpty {
-                await renderer.onRemove(data: entitiesToRemoveOnCancel)
-
-                renderStateLock.lock()
-                for entity in entitiesToRemoveOnCancel {
-                    renderedMarkerEntities.removeValue(forKey: entity.state.id)
-                    _ = markerManager.removeEntity(entity.state.id)
-                }
-                renderStateLock.unlock()
-
-                await renderer.onPostProcess()
-            }
-        }
+        renderer: Renderer
+    ) async -> Bool where Renderer.ActualMarker == ActualMarker {
+        await handleAdd(data: data, viewport: viewport, renderer: renderer)
     }
 
-	    @MainActor
-	    private func addStatesToRenderer(
-	        states: [MarkerState],
-	        renderer: AnyMarkerOverlayRenderer<ActualMarker>
-	    ) async -> [MarkerEntity<ActualMarker>] {
-	        guard !states.isEmpty else { return [] }
-
-        // Check cancellation before renderer call
-        if Task.isCancelled { return [] }
-
-        let addParams = states.map { state in
-            MarkerOverlayAddParams(
-                state: state,
-                bitmapIcon: state.icon?.toBitmapIcon() ?? defaultMarkerIcon
-            )
-        }
-        let actualMarkers = await renderer.onAdd(data: addParams)
-        var addedEntities: [MarkerEntity<ActualMarker>] = []
-        for (index, actualMarker) in actualMarkers.enumerated() {
-            guard let actualMarker else { continue }
-            let entity = MarkerEntity(
-                marker: actualMarker,
-                state: addParams[index].state,
-                visible: true,
-                isRendered: true
-            )
-            markerManager.registerEntity(entity)
-            renderStateLock.lock()
-            renderedMarkerEntities[entity.state.id] = entity
-            renderStateLock.unlock()
-            addedEntities.append(entity)
-        }
-        return addedEntities
+    public override func onUpdate<Renderer: MarkerOverlayRendererProtocol>(
+        state: MarkerState,
+        viewport: GeoRectBounds,
+        renderer: Renderer
+    ) async -> Bool where Renderer.ActualMarker == ActualMarker {
+        await handleUpdate(state: state, viewport: viewport, renderer: renderer)
     }
 
-	    @MainActor
-	    private func animateMarkerMoves(
-	        moves: [AnimatedMove],
-	        renderer: AnyMarkerOverlayRenderer<ActualMarker>,
-	        durationMillis: Int,
-	        token: Int64
-	    ) async -> Bool {
-	        if moves.isEmpty { return true }
-	        var activeMoves = moves
-
-        func animationFrameMillis(forMoveCount count: Int) -> Int {
-            // Keep small animations smooth, but aggressively drop FPS when many markers move.
-            switch count {
-            case ..<50:
-                return 16  // ~60fps
-            case ..<100:
-                return 33  // ~30fps
-            case ..<300:
-                return 125 // ~8fps
-            default:
-                return 250 // ~4fps
-            }
-        }
-
-        let targetFrameMillis = max(1, min(durationMillis, animationFrameMillis(forMoveCount: activeMoves.count)))
-        let steps = max(1, Int(ceil(Double(durationMillis) / Double(targetFrameMillis))))
-        let stepMillis = steps <= 1 ? durationMillis : max(1, Int(round(Double(durationMillis) / Double(steps))))
-
-        let moveIcons: [BitmapIcon] = activeMoves.map { $0.baseState.icon?.toBitmapIcon() ?? defaultMarkerIcon }
-        for step in 1...steps {
-            if token != currentToken() { return false }
-            if Task.isCancelled { return false }
-            let t = Double(step) / Double(steps)
-            var changeParams: [MarkerOverlayChangeParams<ActualMarker>] = []
-            changeParams.reserveCapacity(activeMoves.count)
-            var changeEntities: [MarkerEntity<ActualMarker>] = []
-            changeEntities.reserveCapacity(activeMoves.count)
-
-            for (index, move) in activeMoves.enumerated() {
-                let position = interpolatePosition(start: move.start, end: move.end, t: t)
-                let nextState = move.baseState.copy(position: position)
-                let prevEntity = move.entity
-                let nextEntity = MarkerEntity(
-                    marker: prevEntity.marker,
-                    state: nextState,
-                    visible: true,
-                    isRendered: true
-                )
-                let change = MarkerOverlayChangeParams(
-                    current: nextEntity,
-                    bitmapIcon: moveIcons[index],
-                    prev: prevEntity
-                )
-                changeParams.append(change)
-                changeEntities.append(nextEntity)
-            }
-            if !changeParams.isEmpty {
-                let actualMarkers = await renderer.onChange(data: changeParams)
-
-                for (index, actualMarker) in actualMarkers.enumerated() {
-                    let fallbackMarker = activeMoves[index].entity.marker
-                    let updatedMarker = actualMarker ?? fallbackMarker
-                let updatedEntity = MarkerEntity(
-                    marker: updatedMarker,
-                    state: changeEntities[index].state,
-                    visible: true,
-                    isRendered: true
-                )
-                markerManager.updateEntity(updatedEntity)
-                renderStateLock.lock()
-                renderedMarkerEntities[updatedEntity.state.id] = updatedEntity
-                renderStateLock.unlock()
-                activeMoves[index].entity = updatedEntity
-            }
-
-                await renderer.onPostProcess()
-            }
-            if step < steps {
-                let nanos = UInt64(stepMillis) * 1_000_000
-                try? await Task.sleep(nanoseconds: nanos)
-            }
-        }
-        return true
+    public override func onCameraChanged<Renderer: MarkerOverlayRendererProtocol>(
+        mapCameraPosition: MapCameraPosition,
+        renderer: Renderer
+    ) async where Renderer.ActualMarker == ActualMarker {
+        await handleCameraChanged(mapCameraPosition: mapCameraPosition, renderer: renderer)
     }
 
-    private func interpolatePosition(start: GeoPointProtocol, end: GeoPointProtocol, t: Double) -> GeoPoint {
-        let startAlt = start.altitude ?? 0.0
-        let endAlt = end.altitude ?? 0.0
-        return GeoPoint(
-            latitude: start.latitude + (end.latitude - start.latitude) * t,
-            longitude: start.longitude + (end.longitude - start.longitude) * t,
-            altitude: startAlt + (endAlt - startAlt) * t
-        )
-    }
-
-    private func averageGeoPoints(points: [GeoPoint]) -> GeoPoint {
-        if points.isEmpty { return GeoPoint(latitude: 0.0, longitude: 0.0) }
-        var sumLat = 0.0
-        var sumLon = 0.0
-        for point in points {
-            sumLat += point.latitude
-            sumLon += point.longitude
-        }
-        let count = Double(points.count)
-        return GeoPoint(latitude: sumLat / count, longitude: sumLon / count)
-    }
-
-    private func buildClusterId(cell: ClusterCell, zoom: Double) -> String {
-        return "cluster_\(Int(zoom.rounded()))_\(cell.x)_\(cell.y)"
-    }
-
-    private func projectToPixel(
-        position: GeoPointProtocol,
-        zoom: Double,
-        tileSize: Double
-    ) -> (Double, Double) {
-        let scale = tileSize * pow(2.0, zoom)
-        let sinLat = sin(position.latitude * Self.degToRad)
-        let clamped = min(max(sinLat, -Self.maxSinLat), Self.maxSinLat)
-        let x = (position.longitude + 180.0) / 360.0 * scale
-        let y = (0.5 - log((1.0 + clamped) / (1.0 - clamped)) / (4.0 * Double.pi)) * scale
-        return (x, y)
-    }
-
-    private func updateClusteringTurn(zoom: Double) -> ZoomChange {
+    /// ズームが変わったかを見て、変わっていれば周回数を進める。
+    ///
+    /// 周回数はアイコン提供側（`clusterIconProviderWithTurn`）へ渡り、
+    /// 「ズームするたびに色を変える」といった表現に使われる。
+    /// 小数第 2 位まででズームを丸めるので、わずかな揺れでは進まない。
+    func updateClusteringTurn(zoom: Double) -> ZoomChange {
         let zoomKey = Int((zoom * 100.0).rounded())
         if lastZoomKey == nil {
             clusteringTurn = 1
@@ -1488,307 +321,14 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         return ZoomChange(turn: clusteringTurn, zoomChanged: zoomChanged)
     }
 
-    private func hasCameraMoved(previous: MapCameraPosition, current: MapCameraPosition) -> Bool {
-        let distance = Spherical.computeDistanceBetween(previous.position, current.position)
-        if distance > Self.panAnimationMinDistanceMeters { return true }
-        if abs(previous.bearing - current.bearing) > Self.cameraAngleEpsilon { return true }
-        return abs(previous.tilt - current.tilt) > Self.cameraAngleEpsilon
-    }
-
-    private func metersPerPixel(position: GeoPointProtocol, zoom: Double, tileSize: Double) -> Double {
-        let scale = tileSize * pow(2.0, zoom)
-        let latitudeRadians = position.latitude * Self.degToRad
-        return (Earth.circumferenceMeters * cos(latitudeRadians)) / scale
-    }
-
-    private func mergeClusters(candidates: [ClusterCandidate], zoom: Double, effectiveRadiusPx: Double) -> [MergedCluster] {
-        guard !candidates.isEmpty else { return [] }
-
-        var cellMap: [ClusterCell: ClusterCandidate] = [:]
-        for candidate in candidates {
-            cellMap[candidate.cell] = candidate
-        }
-
-        var merged: [MergedCluster] = []
-        var visited: Set<ClusterCell> = []
-
-        for candidate in candidates {
-            let cell = candidate.cell
-            guard !visited.contains(cell) else { continue }
-            visited.insert(cell)
-
-            var seedMembers = candidate.members
-
-            for dx in -1...1 {
-                for dy in -1...1 {
-                    if dx == 0 && dy == 0 { continue }
-                    let neighborCell = ClusterCell(x: cell.x + dx, y: cell.y + dy)
-                    guard let neighbor = cellMap[neighborCell] else { continue }
-                    guard !visited.contains(neighborCell) else { continue }
-
-                    let metersPerPixelA = metersPerPixel(position: candidate.center, zoom: zoom, tileSize: tileSize)
-                    let metersPerPixelB = metersPerPixel(position: neighbor.center, zoom: zoom, tileSize: tileSize)
-                    let thresholdMeters = effectiveRadiusPx * max(metersPerPixelA, metersPerPixelB)
-                    let distanceMeters = Spherical.computeDistanceBetween(candidate.center, neighbor.center)
-
-                    if distanceMeters <= thresholdMeters {
-                        visited.insert(neighborCell)
-                        seedMembers.append(contentsOf: neighbor.members)
-                    }
-                }
-            }
-
-            let center = selectDenseCenter(members: seedMembers, zoom: zoom, effectiveRadiusPx: effectiveRadiusPx)
-            merged.append(MergedCluster(center: center, members: seedMembers))
-        }
-
-        return merged
-    }
-
-    private func selectDenseCenter(members: [MarkerState], zoom: Double, effectiveRadiusPx: Double) -> GeoPoint {
-        guard !members.isEmpty else { return GeoPoint(latitude: 0.0, longitude: 0.0) }
-        if members.count == 1 {
-            return GeoPoint.from(position: members[0].position)
-        }
-
-        let points = members.map { member -> PixelPoint in
-            let (x, y) = projectToPixel(position: member.position, zoom: zoom, tileSize: tileSize)
-            return PixelPoint(member: member, x: x, y: y)
-        }
-        let cellSize = effectiveRadiusPx
-        var cellMap: [CellKey: [PixelPoint]] = [:]
-        for point in points {
-            let key = CellKey(
-                x: Int(floor(point.x / cellSize)),
-                y: Int(floor(point.y / cellSize))
-            )
-            cellMap[key, default: []].append(point)
-        }
-
-        let sortedCells = cellMap.sorted { $0.value.count > $1.value.count }
-        let candidates = sortedCells
-            .prefix(Self.maxDenseCells)
-            .flatMap { $0.value }
-            .prefix(Self.maxDenseCandidates)
-
-        let radiusSq = cellSize * cellSize
-        var bestPoint = candidates.first ?? points[0]
-        var bestNeighborCount = -1
-        var bestTotalDistance = Double.greatestFiniteMagnitude
-
-        for candidate in candidates {
-            var neighborCount = 0
-            var totalDistance = 0.0
-            for dx in -1...1 {
-                for dy in -1...1 {
-                    let key = CellKey(
-                        x: Int(floor(candidate.x / cellSize)) + dx,
-                        y: Int(floor(candidate.y / cellSize)) + dy
-                    )
-                    let neighbors = cellMap[key] ?? []
-                    for other in neighbors {
-                        let dxp = candidate.x - other.x
-                        let dyp = candidate.y - other.y
-                        let distSq = dxp * dxp + dyp * dyp
-                        if distSq <= radiusSq {
-                            neighborCount += 1
-                            totalDistance += sqrt(distSq)
-                        }
-                    }
-                }
-            }
-            if neighborCount > bestNeighborCount ||
-                (neighborCount == bestNeighborCount && totalDistance < bestTotalDistance) {
-                bestNeighborCount = neighborCount
-                bestTotalDistance = totalDistance
-                bestPoint = candidate
-            }
-        }
-
-        return GeoPoint.from(position: bestPoint.member.position)
-    }
-
-    private func polygonCentroidProjected(_ hull: [HullPoint]) -> HullPoint? {
-        guard hull.count >= 3 else { return nil }
-        var twiceArea = 0.0
-        var cx = 0.0
-        var cy = 0.0
-        for i in hull.indices {
-            let a = hull[i]
-            let b = hull[(i + 1) % hull.count]
-            let cross = a.x * b.y - b.x * a.y
-            twiceArea += cross
-            cx += (a.x + b.x) * cross
-            cy += (a.y + b.y) * cross
-        }
-        if abs(twiceArea) < 1e-6 {
-            let ax = hull.reduce(0.0) { $0 + $1.x } / Double(hull.count)
-            let ay = hull.reduce(0.0) { $0 + $1.y } / Double(hull.count)
-            return HullPoint(x: ax, y: ay)
-        }
-        cx /= 3.0 * twiceArea
-        cy /= 3.0 * twiceArea
-        return HullPoint(x: cx, y: cy)
-    }
-
-    private func convexHullProjected(members: [MarkerState], zoom: Double) -> [HullPoint] {
-        guard members.count >= 3 else { return [] }
-        var points = members.map { state -> HullPoint in
-            let (x, y) = projectToPixel(position: state.position, zoom: zoom, tileSize: tileSize)
-            return HullPoint(x: x, y: y)
-        }
-        var seen = Set<Int64>()
-        points = points.filter { p in
-            let key = (Int64(p.x * 1e3) << 32) ^ Int64(p.y * 1e3)
-            return seen.insert(key).inserted
-        }
-        guard points.count >= 3 else { return [] }
-        points.sort { lhs, rhs in lhs.x != rhs.x ? lhs.x < rhs.x : lhs.y < rhs.y }
-        func cross(_ o: HullPoint, _ a: HullPoint, _ b: HullPoint) -> Double {
-            (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
-        }
-        var lower: [HullPoint] = []
-        for p in points {
-            while lower.count >= 2 && cross(lower[lower.count - 2], lower[lower.count - 1], p) <= 0 { lower.removeLast() }
-            lower.append(p)
-        }
-        var upper: [HullPoint] = []
-        for p in points.reversed() {
-            while upper.count >= 2 && cross(upper[upper.count - 2], upper[upper.count - 1], p) <= 0 { upper.removeLast() }
-            upper.append(p)
-        }
-        let hull = lower.dropLast() + upper.dropLast()
-        return hull.count >= 3 ? Array(hull) : []
-    }
-
-    private func unprojectFromPixel(x: Double, y: Double, zoom: Double) -> GeoPoint {
-        let scale = tileSize * pow(2.0, zoom)
-        let longitude = x / scale * 360.0 - 180.0
-        let sinLat = tanh((0.5 - y / scale) * 2.0 * Double.pi)
-        let latitude = asin(min(max(sinLat, -1.0), 1.0)) * 180.0 / Double.pi
-        return GeoPoint(latitude: latitude, longitude: longitude)
-    }
-
-    @MainActor
-    private func cleanupStaleMarkers(currentZoom: Double, skipClusterRemoval: Bool) async {
-        guard let renderer = rendererBox.get() else { return }
-        let currentZoomKey = Int(currentZoom.rounded())
-
-        renderStateLock.lock()
-        let allEntities = Array(renderedMarkerEntities.values)
-        renderStateLock.unlock()
-
-        sourceStatesLock.lock()
-        let sourceIds = Set(sourceStates.keys)
-        sourceStatesLock.unlock()
-
-        var staleEntities: [MarkerEntity<ActualMarker>] = []
-        for entity in allEntities {
-            let id = entity.state.id
-            let isStale: Bool
-            if id.hasPrefix("cluster_") {
-                if skipClusterRemoval {
-                    isStale = false
-                } else {
-                    // ID format: cluster_{zoomKey}_{x}_{y}
-                    let parts = id.split(separator: "_")
-                    if parts.count >= 4, let markerZoomKey = Int(parts[1]) {
-                        isStale = markerZoomKey != currentZoomKey
-                    } else {
-                        isStale = false
-                    }
-                }
-            } else {
-                isStale = !sourceIds.contains(id)
-            }
-            if isStale { staleEntities.append(entity) }
-        }
-
-        guard !staleEntities.isEmpty else { return }
-        await renderer.onRemove(data: staleEntities)
-        renderStateLock.lock()
-        for entity in staleEntities {
-            renderedMarkerEntities.removeValue(forKey: entity.state.id)
-            _ = markerManager.removeEntity(entity.state.id)
-        }
-        renderStateLock.unlock()
-        await renderer.onPostProcess()
-    }
-
-    // Returns a viewport estimate when the actual visibleRegion is unavailable.
-    // The previous viewport shape is scaled by zoom and recentered on the current camera.
-    private func estimateViewport(zoom: Double, center: GeoPointProtocol) -> GeoRectBounds? {
-        guard let base = lastViewport, let baseZoom = lastKnownViewportZoom else { return nil }
-        guard let sw = base.southWest, let ne = base.northEast else { return nil }
-        let zoomDelta = baseZoom - zoom
-        let scale = pow(2.0, zoomDelta)
-        let wrappedCenter = GeoPoint.from(position: center.wrap())
-        let centerLat = wrappedCenter.latitude
-        let centerLon = wrappedCenter.longitude
-        let lonSpan = sw.longitude <= ne.longitude
-            ? ne.longitude - sw.longitude
-            : ne.longitude + 360.0 - sw.longitude
-        let halfLat = min(90.0, max(0.0, (ne.latitude - sw.latitude) / 2.0 * scale))
-        let halfLon = min(180.0, max(0.0, lonSpan / 2.0 * scale))
-        let result = GeoRectBounds()
-        result.extend(point: GeoPoint(
-            latitude: max(-90.0, min(90.0, centerLat - halfLat)),
-            longitude: wrapLongitude(centerLon - halfLon)
-        ))
-        result.extend(point: GeoPoint(
-            latitude: max(-90.0, min(90.0, centerLat + halfLat)),
-            longitude: wrapLongitude(centerLon + halfLon)
-        ))
-        return result
-    }
-
-    private func wrapLongitude(_ longitude: Double) -> Double {
-        (((longitude + 180.0).truncatingRemainder(dividingBy: 360.0) + 360.0)
-            .truncatingRemainder(dividingBy: 360.0)) - 180.0
-    }
-
-    private func effectiveClusterRadiusPx(zoom: Double) -> Double {
-        let referenceZoom = 10.0
-        let minScale = 0.35
-        let minRadiusPx = 18.0
-        let scale = min(max(zoom / referenceZoom, minScale), 1.0)
-        return max(minRadiusPx, clusterRadiusPx * scale)
-    }
-
-    private func calculateClusterRadiusMeters(center: GeoPoint, members: [MarkerState]) -> Double {
-        var maxDistance = 0.0
-        for state in members {
-            let distance = Spherical.computeDistanceBetween(center, state.position)
-            if distance > maxDistance {
-                maxDistance = distance
-            }
-        }
-        return maxDistance
-    }
-
-    private func containsBounds(container: GeoRectBounds, target: GeoRectBounds) -> Bool {
-        if container.isEmpty || target.isEmpty { return false }
-        guard let sw = target.southWest, let ne = target.northEast else { return false }
-        return container.contains(point: sw) && container.contains(point: ne)
-    }
-
-    private func extendCoverageBounds(bounds: GeoRectBounds, center: GeoPoint, radiusMeters: Double) {
-        let metersPerDegree = 111_320.0
-        let latPad = radiusMeters / metersPerDegree
-        let lonPad = radiusMeters / (metersPerDegree * max(0.1, cos(center.latitude * Self.degToRad)))
-        let expanded = GeoRectBounds(southWest: center, northEast: center)
-            .expandedByDegrees(latPad: latPad, lonPad: lonPad)
-        _ = bounds.union(other: expanded)
-    }
-
-    private func incrementToken() -> Int64 {
+    func incrementToken() -> Int64 {
         tokenLock.lock()
         defer { tokenLock.unlock() }
         cameraUpdateToken += 1
         return cameraUpdateToken
     }
 
-    private func currentToken() -> Int64 {
+    func currentToken() -> Int64 {
         tokenLock.lock()
         defer { tokenLock.unlock() }
         return cameraUpdateToken
@@ -1808,234 +348,34 @@ public final class MarkerClusterStrategy<ActualMarker>: AbstractMarkerRenderingS
         enqueueRender(cameraPosition: cameraPosition, viewport: viewport, token: token)
     }
 
-    // ── Spiderfy (click-to-fan-out) ──────────────────────────────────────────
-
-    /// Cluster clicks first try spiderfy (when configured & zoomed in enough),
-    /// then fall through to the app's `onClusterClick`.
-    private func handleClusterClick(_ cluster: MarkerCluster) {
-        guard spiderfyMinZoom != nil else {
-            onClusterClick?(cluster)
-            return
-        }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            if await self.trySpiderfy(cluster: cluster) { return }
-            self.onClusterClick?(cluster)
-        }
-    }
-
-    /// Fans the cluster's members out around the (kept) cluster marker, or
-    /// collapses the fan when the same cluster is clicked again. Returns
-    /// `false` when spiderfy does not apply (disabled, below `spiderfyMinZoom`,
-    /// or no members) so the click can fall through to `onClusterClick`.
-    @MainActor
-    private func trySpiderfy(cluster: MarkerCluster) async -> Bool {
-        guard let spiderfyMinZoom else { return false }
-        guard let camera = lastCameraPosition, camera.zoom >= spiderfyMinZoom else { return false }
-
-        let clusterKey = cluster.markerIds.sorted().joined(separator: ",")
-        if spiderfyClusterKey == clusterKey {
-            await collapseSpiderfy()
-            return true
-        }
-        await collapseSpiderfy()
-
-        let zoom = camera.zoom
-        sourceStatesLock.lock()
-        let members = cluster.markerIds.compactMap { sourceStates[$0] }
-        sourceStatesLock.unlock()
-        guard !members.isEmpty else { return false }
-
-        // 展開・脚線の中心はクラスタマーカーの「実際の描画位置」を使う。
-        // (描画位置がメンバー平均からずれていても脚線がピンの根元に刺さる)
-        var centerGeo = averageGeoPoints(points: members.map { GeoPoint.from(position: $0.position) })
-        renderStateLock.lock()
-        let renderedStates = renderedMarkerEntities.values.map { $0.state }
-        renderStateLock.unlock()
-        for state in renderedStates {
-            if let extra = state.extra as? MarkerCluster, extra == cluster {
-                centerGeo = GeoPoint.from(position: state.position)
-                break
-            }
-        }
-        let (centerX, centerY) = projectToPixel(position: centerGeo, zoom: zoom, tileSize: tileSize)
-
-        // 周囲に既に描画されている出力マーカー(他クラスタ・他の個別マーカー)を
-        // 障害物として渡し、展開メンバーが重ならないようにする。
-        // クリックされたクラスタ自身(中心とほぼ同位置)は除外し、代わりに
-        // ピン形クラスタの頭部を疑似障害物として加える
-        var obstacles: [SpiderfyOffset] = []
-        for state in renderedStates {
-            let (px, py) = projectToPixel(position: state.position, zoom: zoom, tileSize: tileSize)
-            let rel = SpiderfyOffset(x: px - centerX, y: py - centerY)
-            let d = hypot(rel.x, rel.y)
-            if d < 2 || d > 300 { continue } // 自分自身 or 遠すぎるものは無視
-            obstacles.append(rel)
-        }
-        obstacles.append(SpiderfyOffset(x: 0, y: -(spiderfyMarkerSizePx / 2.0).rounded()))
-
-        let offsets = spiderfyLayout(
-            count: members.count,
-            markerSizePx: spiderfyMarkerSizePx,
-            marginPx: spiderfyMarkerMarginPx,
-            obstacles: obstacles
-        )
-        var clones: [MarkerState] = []
-        var legs: [PolylineState] = []
-        for (index, member) in members.enumerated() {
-            let geo = unprojectFromPixel(
-                x: centerX + offsets[index].x,
-                y: centerY + offsets[index].y,
-                zoom: zoom
-            )
-            clones.append(member.copy(
-                id: "\(spiderfyMarkerIdPrefix)\(member.id)",
-                position: geo,
-                zIndex: 2000
-            ))
-            legs.append(PolylineState(
-                points: [centerGeo, geo],
-                id: "\(spiderfyLegIdPrefix)\(member.id)",
-                strokeColor: spiderfyLegColor,
-                strokeWidth: spiderfyLegWidth,
-                geodesic: false
-            ))
-        }
-        guard !clones.isEmpty else { return false }
-
-        if let prepareExpand {
-            // Defer rendering the fan until the app finishes preparing the
-            // appearing markers (e.g. icon preloading). A collapse or a newer
-            // open supersedes this pending apply via the token.
-            spiderfyToken += 1
-            let token = spiderfyToken
-            Task { @MainActor [weak self] in
-                await prepareExpand(clones)
-                guard let self, self.spiderfyToken == token else { return }
-                await self.applySpiderfy(clusterKey: clusterKey, clones: clones, legs: legs)
-            }
-        } else {
-            await applySpiderfy(clusterKey: clusterKey, clones: clones, legs: legs)
-        }
-        return true
-    }
-
-    @MainActor
-    private func applySpiderfy(
-        clusterKey: String,
-        clones: [MarkerState],
-        legs: [PolylineState]
-    ) async {
-        guard let renderer = rendererBox.get() else { return }
-        let addParams = clones.map { state in
-            MarkerOverlayAddParams(
-                state: state,
-                bitmapIcon: state.icon?.toBitmapIcon() ?? defaultMarkerIcon
-            )
-        }
-        let actualMarkers = await renderer.onAdd(data: addParams)
-        var entities: [MarkerEntity<ActualMarker>] = []
-        for (index, actualMarker) in actualMarkers.enumerated() {
-            guard let actualMarker else { continue }
-            let entity = MarkerEntity(
-                marker: actualMarker,
-                state: addParams[index].state,
-                visible: true,
-                isRendered: true
-            )
-            // Register in markerManager so the provider's tap dispatch can resolve
-            // the clone's state (member onClick still fires on the fanned marker),
-            // but keep it OUT of renderedMarkerEntities so the cluster diff and
-            // stale-marker cleanup never touch it.
-            markerManager.registerEntity(entity)
-            entities.append(entity)
-        }
-        await renderer.onPostProcess()
-        spiderfyEntities = entities
-        spiderfyClusterKey = clusterKey
-        spiderfyLegsSubject.value = legs
-        onSpiderfyChange?(true)
-        MCLog.marker("MarkerClusterStrategy[\(instanceId)].spiderfy open count=\(entities.count)")
-    }
-
-    /// Collapses an open spiderfy fan and invalidates any apply still waiting
-    /// on `prepareExpand`.
-    @MainActor
-    private func collapseSpiderfy() async {
-        spiderfyToken += 1
-        guard spiderfyClusterKey != nil else { return }
-        spiderfyClusterKey = nil
-        let entities = spiderfyEntities
-        spiderfyEntities = []
-        spiderfyLegsSubject.value = []
-        if !entities.isEmpty, let renderer = rendererBox.get() {
-            await renderer.onRemove(data: entities)
-            for entity in entities {
-                _ = markerManager.removeEntity(entity.state.id)
-            }
-            await renderer.onPostProcess()
-        }
-        onSpiderfyChange?(false)
-        MCLog.marker("MarkerClusterStrategy[\(instanceId)].spiderfy collapse")
-    }
-
     public static var defaultIconProvider: ClusterIconProvider {
         { count in DefaultMarkerIcon(label: String(count)) }
     }
 
-    private struct ClusterCandidate {
-        let cell: ClusterCell
-        let center: GeoPoint
-        let members: [MarkerState]
+    struct ZoomChange {
+        let turn: Int
+        let zoomChanged: Bool
     }
 
-    private struct MergedCluster {
-        let center: GeoPoint
-        let members: [MarkerState]
-    }
-
-    private struct AnimatedAdd {
+    /// 出てくるマーカー 1 件と、その出発点。
+    struct AnimatedAdd {
         let state: MarkerState
         let start: GeoPoint
     }
 
-    private struct AnimatedRemove {
+    /// 消えるマーカー 1 件と、その行き先。
+    struct AnimatedRemove {
         let entity: MarkerEntity<ActualMarker>
         let target: GeoPoint
     }
 
-    private struct AnimatedMove {
+    /// アニメーションで動かす 1 件。`entity` は 1 フレームごとに差し替わる。
+    struct AnimatedMove {
         let id: String
         let start: GeoPointProtocol
         let end: GeoPointProtocol
         let baseState: MarkerState
         var entity: MarkerEntity<ActualMarker>
-    }
-
-    private struct ZoomChange {
-        let turn: Int
-        let zoomChanged: Bool
-    }
-
-    private struct ClusterCell: Hashable {
-        let x: Int
-        let y: Int
-    }
-
-    private struct PixelPoint {
-        let member: MarkerState
-        let x: Double
-        let y: Double
-    }
-
-    private struct HullPoint {
-        let x: Double
-        let y: Double
-    }
-
-    private struct CellKey: Hashable {
-        let x: Int
-        let y: Int
     }
 }
 
@@ -2057,88 +397,5 @@ extension MarkerClusterStrategy: PolygonSyncHandler {
             )
             await polygonSync(states)
         }
-    }
-}
-
-private actor RenderQueueState {
-    private var pending: RenderRequest?
-
-    func enqueue(_ request: RenderRequest) {
-        pending = request
-    }
-
-    func take() -> RenderRequest? {
-        let next = pending
-        pending = nil
-        return next
-    }
-
-    func clear() {
-        pending = nil
-    }
-}
-
-private struct RenderRequest {
-    let cameraPosition: MapCameraPosition
-    let viewport: GeoRectBounds
-    let token: Int64
-}
-
-private final class MainQueueReleaseBox<T> {
-    private let lock = NSLock()
-    private var value: T?
-
-    func get() -> T? {
-        lock.lock()
-        defer { lock.unlock() }
-        return value
-    }
-
-    func set(_ newValue: T?) {
-        if !Thread.isMainThread {
-            MCLog.marker("MainQueueReleaseBox.set called off main thread")
-        }
-        let old: T?
-        lock.lock()
-        old = value
-        value = newValue
-        lock.unlock()
-
-        guard old != nil else { return }
-        DispatchQueue.main.async {
-            _ = old
-        }
-    }
-
-    deinit {
-        let old: T?
-        lock.lock()
-        old = value
-        value = nil
-        lock.unlock()
-
-        guard old != nil else { return }
-        DispatchQueue.main.async {
-            _ = old
-        }
-    }
-}
-
-private enum Earth {
-    static let radiusMeters: Double = 6371009.0
-    static let circumferenceMeters: Double = 2.0 * Double.pi * radiusMeters
-}
-
-private enum Spherical {
-    static func computeDistanceBetween(_ a: GeoPointProtocol, _ b: GeoPointProtocol) -> Double {
-        let lat1 = a.latitude * Double.pi / 180.0
-        let lat2 = b.latitude * Double.pi / 180.0
-        let dLat = lat2 - lat1
-        let dLon = (b.longitude - a.longitude) * Double.pi / 180.0
-
-        let sinDLat = sin(dLat / 2.0)
-        let sinDLon = sin(dLon / 2.0)
-        let h = sinDLat * sinDLat + cos(lat1) * cos(lat2) * sinDLon * sinDLon
-        return 2.0 * Earth.radiusMeters * asin(min(1.0, sqrt(h)))
     }
 }
