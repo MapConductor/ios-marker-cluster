@@ -12,7 +12,7 @@ let coreDependency: Package.Dependency = usingLocalCore
     : .package(url: "https://github.com/MapConductor/ios-sdk-core", from: "1.0.0")
 
 let package = Package(
-    name: "mapconductor-marker-cluster",
+    name: "mapconductor-marker-clustering",
     platforms: [
         // See ios-sdk-core/Package.swift's comment: "15.0" must not be used here.
         .iOS("15.1"),
@@ -20,9 +20,9 @@ let package = Package(
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
-            name: "MapConductorMarkerCluster",
+            name: "MapConductorMarkerClustering",
             type: frameworkLibraryType,
-            targets: ["MapConductorMarkerCluster"]
+            targets: ["MapConductorMarkerClustering"]
         ),
     ],
     dependencies: [
@@ -32,7 +32,7 @@ let package = Package(
         // Targets are the basic building blocks of a package, defining a module or a test suite.
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
-            name: "MapConductorMarkerCluster",
+            name: "MapConductorMarkerClustering",
             dependencies: [
                 .product(name: "MapConductorCore", package: "ios-sdk-core"),
             ],
