@@ -3,6 +3,7 @@ AGENTS.md
 CLAUDE.md
 Secrets.*
 .*
+!.github
 !.gitignore
 !.gitkeep
 .build

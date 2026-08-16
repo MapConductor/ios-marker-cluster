@@ -1,0 +1,41 @@
+name: Build
+
+# 単体ビルドと公開 API サーフェスの検証。
+#
+# ## なぜモジュール側に置くのか
+#
+# 親（ios-sdk）の api-surface.yml は親リポジトリの PR でしか回らない。
+# モジュールは独立したリポジトリなので、そちらの PR は誰も検証していなかった。
+# android-sdk では同じ穴が原因で、単体ビルドの設定が腐っていることに
+# リリース当日まで気づけなかった（todo/20260816.txt §8）。
+#
+# ## ここで回せるモジュールの条件
+#
+# ベンダー SDK を必要としないこと。プロバイダの多くは再配布できない SDK
+# （heresdk / ios-maps-sdk）やトークン（Mapbox）が要るので CI では組めない。
+# このモジュールは MapConductorCore にしか依存しないので回せる。
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: xcodebuild -version && swift --version
+
+      - name: Build
+        run: |
+          scheme=$(sed -n 's/^[[:space:]]*name: "\([^"]*\)".*/\1/p' Package.swift | head -1)
+          echo "scheme=$scheme"
+          xcodebuild -scheme "$scheme" \
+            -destination 'generic/platform=iOS Simulator' \
+            build
